@@ -77,9 +77,7 @@ compose.override.yml
 /training/runs/
 /training/*.zip
 
-# AI agent instructions and handoff notes stay local
-.ai/
-AGENTS.md
-CLAUDE.md
+# Claude Code tool settings and personal instructions stay local.
+# AGENTS.md, CLAUDE.md, .ai/ and docs/agent/ are shared through Git (no server paths or credentials inside).
 .claude/
-/docs/agent/
+CLAUDE.local.md
