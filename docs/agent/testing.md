@@ -6,7 +6,7 @@
 
 | 변경 영역 | 존재하는 검증 명령 |
 | --- | --- |
-| 카메라 설정/metadata/runtime/reconnect | `python3 -m unittest discover -s tests -p 'test_camera_*.py'` |
+| 카메라 설정/metadata/runtime/reconnect/source 재설정 정책과 제어 루프(fake Gst) | `python3 -m unittest discover -s tests -p 'test_camera_*.py'` |
 | NvDCF OpenCV YAML 진단 파싱/traceback 비밀값 보호 | `python3 -m unittest discover -s tests -p 'test_camera_diagnostics.py'` |
 | PGIE build identity, native engine 저장 경로, 프로세스 간 경로 재사용 | `python3 -m unittest discover -s tests -p 'test_pgie_cache.py'` |
 | 첫 영상 startup timing / batch camera attribution / HTTP 저장·flush 경계 | `python3 -m unittest discover -s tests -p 'test_camera_startup_timing.py'` |

@@ -76,6 +76,10 @@ def parse_args():
         help="Discard RTSP jitter-buffer frames beyond latency; default: enabled",
     )
     parser.add_argument(
+        "--source-recovery", action=argparse.BooleanOptionalAction, default=True,
+        help="Reset a source bin in place after consecutive frameless attempts; default: enabled",
+    )
+    parser.add_argument(
         "--mux-live-source", type=int, choices=(0, 1), default=1,
         help="Legacy mux timestamp mode; 0 is an experiment for matching-FPS sources",
     )
@@ -440,6 +444,7 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
 
     Only parking cameras selected by the vehicle detector get a full-frame ROI, so
     other cameras pass through without inference while sharing RTSP/JPEG output.
+    A source bin that stays silent is reset in place from this control loop.
     """
     startup = getattr(args, "startup_timing", None)
     vehicle_detector = getattr(args, "vehicle_detector", None)
@@ -454,6 +459,7 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
     deployment = None
     pipeline = None
     requested_pads = []
+    source_bins = {}
     bus = None
     failed = None
     pipeline_stop = threading.Event()
@@ -774,6 +780,38 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
             return Gst.PadProbeReturn.DROP
         return Gst.PadProbeReturn.OK
 
+    def reset_source(index):
+        """Reset one silent source bin in place (deepstream-app reset_source_pipeline pattern).
+
+        The mux sink pad, the outer ghost pad and its probes stay; the bin's elements go
+        NULL -> PLAYING so nvurisrcbin rebuilds RTSP and decoder. Internals are not touched.
+        """
+        camera = cameras_by_source[index]
+        source_bin = source_bins[index]
+
+        def failed(stage):
+            manager.recovery_failed(index)
+            print("source_reset_failed " + json.dumps({"camera_id": camera.camera_id, "source_id": camera.source_id,
+                  "stage": stage}, separators=(",", ":")), flush=True)
+
+        if source_bin.set_state(Gst.State.NULL) == Gst.StateChangeReturn.FAILURE:
+            failed("null")
+            return
+        ghost_pad = source_bin.get_static_pad("src")
+        target = ghost_pad.get_target()
+        if target is not None and target.get_parent() is None:
+            # The plugin dropped its pad without pad-removed; pad-added links the new one.
+            # A pad that survives NULL keeps the existing ghost link (GStreamer cannot re-add it).
+            ghost_pad.set_target(None)
+        if not source_bin.sync_state_with_parent():
+            failed("sync")
+            return
+        generation = manager.recovered(index)
+        print("source_reset " + json.dumps({"camera_id": camera.camera_id, "source_id": camera.source_id,
+              "generation": generation,
+              "recovery_count": manager.runtimes[camera.source_id].snapshot().recovery_count},
+              separators=(",", ":")), flush=True)
+
     try:
         pipeline = Gst.Pipeline.new("preview-detection")
         if pipeline is None:
@@ -860,6 +898,7 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
             source_bin.get_static_pad("src").add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, source_event, index)
             add_timing_probe(source_bin.get_static_pad("src"), "decoded", index)
             pipeline.add(source_bin)
+            source_bins[index] = source_bin
             mux_pad = mux.request_pad_simple(f"sink_{index}")
             if mux_pad is None:
                 raise RuntimeError(f"Could not request nvstreammux sink_{index}")
@@ -927,7 +966,9 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
                 message = bus.timed_pop_filtered(100 * Gst.MSECOND, message_types)
                 if message is not None:
                     on_message(bus, message)
-                manager.tick()
+                due = manager.tick()
+                if due and not shutdown.is_set() and not pipeline_stop.is_set():
+                    reset_source(due[0])  # one bin per tick; the rest stay offline until later ticks
                 if deployment is not None:
                     try:
                         deployment.tick()
@@ -1072,7 +1113,8 @@ def run(args, metadata_store=None, runtime_statuses=None):
     server.realtime_hub = RealtimeHub(metadata_snapshot, stream_snapshot, stores, shutdown)
     parking_relay = ParkingRelay(os.environ.get('PREVIEW_BACKEND_URL', 'http://127.0.0.1:8000'),
                                  server.realtime_hub, shutdown)
-    manager = CameraRuntimeManager(args.cameras, runtime_statuses, stores, metadata_store)
+    manager = CameraRuntimeManager(args.cameras, runtime_statuses, stores, metadata_store,
+                                   recovery_enabled=getattr(args, "source_recovery", True))
     manager.begin()
     result = 1
     old_handlers = {}

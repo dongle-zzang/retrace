@@ -53,6 +53,12 @@ class RTSPInputTests(unittest.TestCase):
             with patch('sys.argv', ['preview.py', '--input', 'rtsp://camera.example/v', *flags]):
                 self.assertEqual(parser().rtsp_drop_on_latency, expected)
 
+    def test_preview_source_recovery_defaults_on_and_can_be_disabled(self):
+        parser = load_parsers()[0]
+        for flags, expected in (([], True), (['--source-recovery'], True), (['--no-source-recovery'], False)):
+            with patch('sys.argv', ['preview.py', '--input', 'rtsp://camera.example/v', *flags]):
+                self.assertEqual(parser().source_recovery, expected)
+
     def test_startup_subset_requires_diagnostics_and_preserves_order(self):
         parser = load_parsers()[0]
         inputs = [item for i in range(4) for item in ('--input', f'rtsp://camera{i}.example/v')]

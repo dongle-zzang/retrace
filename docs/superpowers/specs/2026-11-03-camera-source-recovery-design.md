@@ -1,6 +1,17 @@
 # 카메라 source bin 복구 설계 (2026-11-03)
 
-상태: 설계 승인됨, 구현 대기. 구현과 GPU 검증은 서버 체크아웃에서 수행한다.
+상태: 구현됨 (2026-11-03, 서버 체크아웃, 브랜치 `claude/camera-source-recovery`). CPU 테스트 통과, GPU 검증(§6)과 배포는 대기.
+운영 설명 본문은 [docs/operations.md](../../operations.md) "카메라 runtime lifecycle"의 "source 복구 정책"으로 옮겼다.
+
+구현 메모(설계와 다른 점):
+
+- §4-2 2단계: ghost pad target을 무조건 비우지 않는다. NULL 전이 후 target pad가 부모 element를 잃은 경우(plugin이
+  pad-removed 없이 pad를 버린 경우)에만 `set_target(None)`한다. GStreamer는 부모가 있는 pad를 다시 add할 수 없으므로
+  NULL을 거쳐도 유지되는 pad는 기존 링크로 데이터가 흐르고, 교체되는 pad는 기존 `pad-removed`(target 비움) →
+  `pad-added`(재연결) 순서로 처리된다. 무조건 비우면 pad가 유지되는 경우 링크가 끊겨 복구되지 않는다.
+- §4-1 `recovery_failed()`도 `_recoveries`를 올려 간격이 120 → 300 → 600초로 늘어난다(실패하는 재설정을 2분마다
+  반복하지 않기 위해). `recovery_count`는 성공한 재설정만 센다.
+- 재설정 실패 시 `source_reset_failed {camera_id, source_id, stage}`(stage는 null/sync)를 항상 출력한다.
 관련 코드: `preview.py`, `camera_runtime.py`, `app.py`. 관련 문서: [docs/operations.md](../../operations.md) "카메라 runtime lifecycle".
 
 ## 1. 배경과 근거

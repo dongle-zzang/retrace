@@ -16,7 +16,7 @@ RTSP → retrace (preview.py, 공유 DeepStream batch pipeline)
 - `app.py`: preview가 재사용하는 RTSP source bin helper만 남았다. PeopleNet CLI/PGIE 준비 함수는 2026-10-13 제거했다.
 - `pgie_cache.py`: 명시적 TensorRT build identity, `.cache/vehicle/pgie` 모델 staging 및 config/GObject engine 경로 일치를 담당한다. 캐시 정책과 최초 rebuild/legacy 처리 범위는 [README의 모델 준비](../../README.md)를 따른다.
 - `camera_config.py`: 공통 YAML 검증, 공개 설정 추출, private RTSP resolve. backend는 `load_public_cameras()`만 사용한다.
-- `camera_runtime.py`: CameraRuntimeManager/CameraRuntime의 슬롯 매핑, 프레임 기반 상태, 관측 재연결 세대와 PTS 세대 라우팅. GPU lifecycle은 소유하지 않는다. 상태 설정과 실제 연결 대상인 YAML `enabled`는 역할이 다르다.
+- `camera_runtime.py`: CameraRuntimeManager/CameraRuntime의 슬롯 매핑, 프레임 기반 상태, 관측 재연결 세대와 PTS 세대 라우팅, 침묵한 source의 재설정 시점·간격(recovery 정책, `tick()`이 대상 slot을 반환). GPU lifecycle은 소유하지 않으며 실제 source bin NULL → PLAYING 재설정은 `preview.py` 제어 루프가 수행한다. 상태 설정과 실제 연결 대상인 YAML `enabled`는 역할이 다르다.
 - `person_metadata.py`: vehicle PyDS 값의 immutable 복사와 최신 frame 저장(모듈명과 빈 `persons` 필드는 계약 호환용).
 - `vehicle_detection.py`: `VEHICLE_CAMERA_IDS` 주차장 카메라의 full-frame ROI → 공유 YOLO11m secondary detector 하나(batch=주차장 카메라 수) → class 분리 후 NvDCF. enabled가 아닌 ID는 건너뛴다. 모델/config 준비는 기존 engine cache를 별도 namespace로 재사용한다.
 - `vehicle_deployment.py`: `VEHICLE_DEPLOYMENT_ENABLED=1`일 때 차량 nvinfer의 config 기반 on-the-fly model update, 추론 검증, committed 모델 journal과 자동/수동 롤백을 preview control loop에서 소유한다. host worker와는 `.cache/vehicle-deployments` 파일 mailbox로만 통신하고 engine은 `tools/build_vehicle_engine.py` 별도 프로세스가 만든다. 절차·판정 기준은 [docs/training.md §4-2](../training.md).

@@ -13,6 +13,8 @@ from rtsp_diagnostics import RTSP_REASONS
 ERRORS = frozenset({'rtsp_error', 'rtsp_timeout', 'source_eos', 'pipeline_error',
                     'pipeline_setup_failed', 'no_frames', 'output_stalled', 'rtsp_config_error'})
 BACKOFF = (1, 2, 5, 10, 30)
+# Minimum spacing between in-place source bin resets; keeps retrying at the cap.
+RECOVERY_BACKOFF = (120, 300, 600)
 
 
 @dataclass(frozen=True)
@@ -27,6 +29,7 @@ class CameraStatus:
     generation: int = 0
     output_frame_age: float | None = None
     error_reason: str | None = None
+    recovery_count: int = 0
 
     def to_dict(self):
         return asdict(self)
@@ -38,6 +41,10 @@ class CameraRuntime:
     decoded frames determine health; output progress is checked separately to
     detect a stalled inference/JPEG chain. FPS uses a bounded five-second window.
     Recovery requires continuous frames, not merely a successful RTSP handshake.
+
+    A source that stays silent (consecutive attempts without any frame) becomes
+    due for an in-place source bin reset owned by the preview control loop; this
+    class only decides when and how often, never touching GStreamer.
     """
     def __init__(self, camera_id, degraded_after=3.0, offline_after=10.0,
                  connect_timeout=30.0, min_fps=1.0, recovery_seconds=2.0,
@@ -60,9 +67,15 @@ class CameraRuntime:
         self._failures = 0
         self._retry_at = self._started
         self._stable_reset = False
+        self._frameless_attempts = 0
+        self._recoveries = 0
+        self._recovery_not_before = self._started
 
     def begin_attempt(self, watchdog=True):
         with self._lock:
+            return self._begin_attempt(watchdog)
+
+    def _begin_attempt(self, watchdog):
             retry = self._status.generation > 0
             now = self.clock()
             self._started = now
@@ -93,6 +106,7 @@ class CameraRuntime:
                 self._continuous_since = now
             self._last_frame = self._ever_frame = now
             self._frames.append(now)
+            self._frameless_attempts = 0
             self._status = replace(self._status, last_frame_at=self.wall_clock().isoformat(timespec='milliseconds'))
             self._update(now)
 
@@ -135,6 +149,7 @@ class CameraRuntime:
                 # Flapping sources retain their accumulated backoff until stable.
                 if not self._stable_reset and now - self._continuous_since >= 30:
                     self._failures = 0
+                    self._recoveries = 0
                     self._stable_reset = True
         self._status = replace(self._status, state=state, fps=round(fps, 2))
 
@@ -142,6 +157,8 @@ class CameraRuntime:
         self._running = False
         self.attempt_stop.set()
         self._failures += 1
+        if self._last_frame is None:
+            self._frameless_attempts += 1
         self._retry_at = self.clock() + BACKOFF[min(self._failures - 1, len(BACKOFF) - 1)]
         self._status = replace(self._status, state='offline', fps=0.0,
                                last_error=error if error in ERRORS else 'pipeline_error')
@@ -185,6 +202,29 @@ class CameraRuntime:
         with self._lock:
             return max(0.0, self._retry_at - self.clock())
 
+    def recovery_due(self):
+        """Two consecutive attempts without a single frame and the spacing has elapsed."""
+        with self._lock:
+            return (not self._running and self._frameless_attempts >= 2
+                    and self.clock() >= self._recovery_not_before)
+
+    def _defer_recovery(self):
+        self._recoveries += 1
+        self._recovery_not_before = self.clock() + RECOVERY_BACKOFF[min(self._recoveries - 1, len(RECOVERY_BACKOFF) - 1)]
+
+    def begin_recovery(self):
+        """Start the attempt that follows an in-place source reset; returns its generation."""
+        with self._lock:
+            self._defer_recovery()
+            self._status = replace(self._status, recovery_count=self._status.recovery_count + 1)
+            return self._begin_attempt(watchdog=True)
+
+    def recovery_failed(self):
+        """The reset itself failed: space the next one out; ordinary attempts continue."""
+        with self._lock:
+            self._defer_recovery()
+            self._status = replace(self._status, state='offline', fps=0.0, last_error='pipeline_error')
+
     def snapshot(self):
         with self._lock:
             now = self.clock()
@@ -202,7 +242,7 @@ class CameraRuntimeManager:
     PTS associates decoded, tracked and encoded frames with their original epoch
     so queued buffers cannot republish old metadata/JPEG after a health failure.
     """
-    def __init__(self, cameras, runtimes, stores, metadata_store):
+    def __init__(self, cameras, runtimes, stores, metadata_store, recovery_enabled=True):
         self.cameras_by_slot = dict(enumerate(cameras))
         self.slots_by_camera = {camera.camera_id: slot for slot, camera in self.cameras_by_slot.items()}
         self.slots_by_source = {camera.source_id: slot for slot, camera in self.cameras_by_slot.items()}
@@ -210,6 +250,7 @@ class CameraRuntimeManager:
                 or len(self.slots_by_source) != len(cameras)):
             raise ValueError('Camera identities must be nonempty and unique')
         self.runtimes, self.stores, self.metadata_store = runtimes, stores, metadata_store
+        self.recovery_enabled = recovery_enabled
         self._lock = threading.Lock()
         self._frames = {slot: OrderedDict() for slot in self.cameras_by_slot}
 
@@ -248,14 +289,30 @@ class CameraRuntimeManager:
             return runtime.record_error_reason(reason, runtime.snapshot().generation)
 
     def tick(self):
+        """Expire faulty attempts, restart due ones; return slots due for a source reset.
+
+        Returned slots are left offline: the caller resets the source bin outside
+        this lock and then calls recovered() or recovery_failed() for that slot.
+        """
+        due = []
         with self._lock:
             for slot, camera in self.cameras_by_slot.items():
                 runtime = self.runtimes[camera.source_id]
                 if runtime.check_health():
                     self._clear(slot)
                 if runtime.snapshot().state == 'offline' and runtime.retry_delay() == 0:
-                    # No element creation or state change: nvurisrcbin owns RTSP retry.
-                    runtime.begin_attempt()
+                    if self.recovery_enabled and runtime.recovery_due():
+                        due.append(slot)
+                    else:
+                        # No element creation or state change: nvurisrcbin owns RTSP retry.
+                        runtime.begin_attempt()
+        return due
+
+    def recovered(self, slot):
+        return self.runtimes[self.cameras_by_slot[slot].source_id].begin_recovery()
+
+    def recovery_failed(self, slot):
+        self.runtimes[self.cameras_by_slot[slot].source_id].recovery_failed()
 
     def observe_decoded(self, slot, pts):
         with self._lock:

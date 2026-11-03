@@ -152,6 +152,118 @@ class RuntimeTests(unittest.TestCase):
                 CameraRuntime('first', **kwargs)
 
 
+class RecoveryPolicyTests(unittest.TestCase):
+    """Source reset policy: consecutive frameless attempts, spaced recoveries, no GStreamer."""
+    def setUp(self):
+        self.now = 0.0
+        self.runtime = CameraRuntime('first', clock=lambda: self.now,
+                                     wall_clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc))
+
+    def frames(self, seconds=3):
+        generation = self.runtime.snapshot().generation
+        for _ in range(seconds * 10):
+            self.now += .1
+            self.runtime.observe_frame(generation)
+            self.runtime.observe_output(generation)
+
+    def frameless_attempt(self, backoff):
+        self.now += backoff
+        self.runtime.begin_attempt()
+        self.now += 30
+        self.assertEqual(self.runtime.check_health(), 'no_frames')
+
+    def silence_after_frames(self):
+        """Design timeline: last frame T, no_frames at T+10, frameless attempts end at T+41 and T+73."""
+        self.runtime.begin_attempt()
+        self.frames()
+        self.now += 10
+        self.assertEqual(self.runtime.check_health(), 'no_frames')
+        self.assertFalse(self.runtime.recovery_due())  # that attempt had frames
+        self.frameless_attempt(1)
+        self.assertFalse(self.runtime.recovery_due())
+        self.frameless_attempt(2)
+
+    def test_recovery_due_after_two_consecutive_frameless_attempts(self):
+        self.silence_after_frames()
+        self.assertTrue(self.runtime.recovery_due())
+        self.assertEqual(self.runtime.snapshot().state, 'offline')
+        self.assertEqual(self.runtime.snapshot().recovery_count, 0)
+
+    def test_frames_in_between_restart_the_frameless_count(self):
+        self.runtime.begin_attempt()
+        self.frameless_attempt(0)
+        self.now += 1
+        generation = self.runtime.begin_attempt()
+        self.runtime.observe_frame(generation)
+        self.now += 10
+        self.assertEqual(self.runtime.check_health(), 'no_frames')
+        self.frameless_attempt(2)
+        self.assertFalse(self.runtime.recovery_due())
+        self.frameless_attempt(5)
+        self.assertTrue(self.runtime.recovery_due())
+
+    def test_begin_recovery_advances_generation_and_spaces_recoveries(self):
+        self.silence_after_frames()
+        before = self.runtime.snapshot()
+        for count, interval in enumerate((120, 300, 600, 600), start=1):
+            self.assertTrue(self.runtime.recovery_due())
+            generation = self.runtime.begin_recovery()
+            status = self.runtime.snapshot()
+            self.assertEqual((status.generation, status.reconnect_count, status.recovery_count),
+                             (before.generation + count, before.reconnect_count + count, count))
+            self.assertEqual(status.state, 'reconnecting')
+            self.assertFalse(self.runtime.recovery_due())  # running
+            self.now += 30
+            self.assertEqual(self.runtime.check_health(), 'no_frames')
+            self.now += interval - 30 - 1
+            self.assertFalse(self.runtime.recovery_due())
+            self.now += 1
+            self.assertEqual(self.runtime.snapshot().generation, generation)
+
+    def test_stable_frames_reset_recovery_spacing(self):
+        self.silence_after_frames()
+        self.runtime.begin_recovery()
+        self.runtime.begin_attempt()  # a later ordinary attempt, still frameless
+        self.now += 30
+        self.assertEqual(self.runtime.check_health(), 'no_frames')
+        self.now += 120
+        self.runtime.begin_recovery()  # second recovery: spacing would now be 300
+        self.frames(seconds=31)
+        self.assertEqual(self.runtime.snapshot().state, 'online')
+        self.assertEqual(self.runtime.retry_delay(), 0)
+        self.now += 10
+        self.assertEqual(self.runtime.check_health(), 'no_frames')
+        self.frameless_attempt(1)
+        self.frameless_attempt(2)
+        self.now += 300
+        self.assertTrue(self.runtime.recovery_due())
+        self.runtime.begin_recovery()
+        self.now += 30
+        self.assertEqual(self.runtime.check_health(), 'no_frames')
+        self.now += 120  # spacing restarted at 120 after the stable period
+        self.assertTrue(self.runtime.recovery_due())
+        self.assertEqual(self.runtime.snapshot().recovery_count, 3)
+
+    def test_recovery_failed_defers_next_recovery_and_records_pipeline_error(self):
+        self.silence_after_frames()
+        self.now += self.runtime.retry_delay()  # tick only hands a slot over once its backoff ended
+        self.runtime.recovery_failed()
+        status = self.runtime.snapshot()
+        self.assertEqual((status.state, status.last_error, status.recovery_count), ('offline', 'pipeline_error', 0))
+        self.assertFalse(self.runtime.recovery_due())
+        self.assertEqual(self.runtime.retry_delay(), 0)  # ordinary attempts continue meanwhile
+        self.frameless_attempt(0)
+        self.now += 120 - 30
+        self.assertTrue(self.runtime.recovery_due())
+
+    def test_status_serializes_recovery_count_without_secrets(self):
+        generation = self.runtime.begin_attempt()
+        self.runtime.fail('rtsp://private-secret@camera.example/video', generation)
+        serialized = json.dumps(self.runtime.snapshot().to_dict(), allow_nan=False)
+        self.assertIn('"recovery_count": 0', serialized)
+        self.assertNotIn('private-secret', serialized)
+
+
 class StoreTests(unittest.TestCase):
     def test_mjpeg_clear_advances_sequence_and_resumes_same_connection(self):
         import io

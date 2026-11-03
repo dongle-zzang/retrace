@@ -201,8 +201,8 @@ last_frame_age/output_frame_age는 monotonic 시간 기반 경과 초입니다.
 추가 decoder surface 4개를 nvurisrcbin 속성으로 설정합니다. 내부 child 속성을 재설정하지 않으며,
 child-added는 diagnostics/probe 관측 시에만 연결합니다. 지연 초과 드롭을 끄려면
 `--no-rtsp-drop-on-latency`를 사용합니다. source별 decoder는 필요하지만 inference/tracker는 각각 하나입니다.
-source bin이나 mux pad를 동적으로 remove/re-add하지 않습니다. 주소/credential은 시작 시 읽은 값을
-재사용합니다. **기존 worker와 달리 실행 중 .env 변경을 재연결 시 다시 읽지 않습니다.**
+source bin이나 mux pad를 제거/재생성하지 않으며, 침묵한 source bin만 제자리에서 NULL → PLAYING으로
+재설정합니다(아래 복구 정책). 주소/credential은 시작 시 읽은 값을 재사용합니다. **기존 worker와 달리 실행 중 .env 변경을 재연결 시 다시 읽지 않습니다.**
 `.env` 또는 enabled 카메라 목록 변경 후 컨테이너를 재생성해 환경변수와 batch-size를 함께 갱신하세요.
 `--input`으로 지정한 카메라는 명시 URI를 유지합니다.
 
@@ -214,6 +214,16 @@ decoded PTS에 관측 generation을 연결해 tracker/encoder에 대기 중이�
 (source당 최대 512개 PTS; 유효 PTS가 없는 프레임은 공개하지 않습니다).
 재연결 후 새 JPEG가 들어오면 같은 브라우저 연결로 재생됩니다. 이미 브라우저에 표시된 마지막
 이미지는 새 JPEG가 올 때까지 남을 수 있으므로 /streams.json의 runtime 상태를 함께 확인하세요.
+
+source 복구 정책: 프레임을 한 장도 받지 못한 관측 시도가 2회 연속 끝나면(마지막 프레임 후 약 73초,
+기동 후 한 번도 안 뜬 카메라는 PLAYING 후 약 63초) 제어 루프가 그 카메라의 `source-bin-N`만 NULL → PLAYING으로
+재설정합니다(deepstream-app `reset_source_pipeline`과 같은 방식). mux sink pad, ghost pad, probe는 유지되고
+nvurisrcbin이 RTSP 연결과 디코더를 다시 만듭니다. ghost pad target은 plugin이 pad-removed 없이 pad를 버린
+경우에만 비웁니다. 재설정 간격은 120 → 300 → 600초(최대, 포기하지 않음)이며 30초 이상 안정 수신 후
+초기화됩니다. tick당 1대만 재설정합니다. `/streams.json` runtime과 `camera_status` 로그의 `recovery_count`가
+증가하고 `source_reset {camera_id, source_id, generation, recovery_count}` 한 줄을 항상 출력합니다. 재설정
+자체가 실패하면 `source_reset_failed {camera_id, source_id, stage}`를 남기고 last_error=pipeline_error로 다음
+간격까지 미루며 일반 관측 재시도는 계속됩니다. `--no-source-recovery`로 끄면 기존 관측 재시도만 수행합니다.
 
 기존 `/streams.json`에 runtime 객체를 추가합니다. 호환 status는 connected/starting을 유지하고
 실제 상태는 runtime.state로 확인합니다. `run(..., runtime_statuses={})`에 전달한 dict에는
@@ -233,8 +243,9 @@ Demux branch는 leaky queue(최대 1 frame)와 appsink sync=false/async=false를
 branch의 대기와 offline branch의 preroll을 제한합니다. 출력은 차량 OSD bbox(`Vehicle`) 및 1280×720 JPEG입니다.
 하나의 batch buffer를 여러 branch가 공유하므로 네이티브 JPEG/OSD plugin 자체가 멈추는 경우까지
 완전한 장애 격리를 보장하지 않습니다. 공유 inference/tracker 오류는 모든 카메라를 실패 처리하고
-exit-code=1로 종료합니다. source 오류/timeout만으로 전체 restart하지 않으며, native RTSP reconnect가
-멈추거나 output chain이 영구적으로 실패하면 운영자가 진단 후 retrace를 재시작해야 합니다.
+exit-code=1로 종료합니다. source 오류/timeout만으로 전체 restart하지 않습니다. native RTSP reconnect가
+멈춘 카메라는 위 복구 정책이 source bin을 재설정하며, 재설정 후에도 `recovery_count`만 늘고 online이 되지
+않거나 output chain이 영구적으로 실패하면 운영자가 진단 후 retrace를 재시작해야 합니다.
 GPU OOM/드라이버 오류/native crash는 source 단위로 격리되지 않습니다.
 25대 처리 가능 여부는 GPU/NVDEC/JPEG/네트워크 측정 후 판단해야 합니다.
 
