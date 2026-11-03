@@ -1,11 +1,16 @@
 # Current work (server / pipeline / backend)
 
-- Active task: none
-- Status: idle (2026-10-28, PC 체크아웃 기준)
-- Remaining work: none in progress. 미해결 항목은 아래 Important context.
-- Verification pending: none
-- Blockers: none
-- Next action: record the next requested task here before implementation.
+- Active task: 카메라 source bin 자동 복구 (일부 카메라가 침묵 상태로 영구 offline, 재시작만 통하는 문제)
+- Status: 설계 승인·문서화 완료 (2026-11-03, PC 체크아웃). 구현 미착수.
+- Remaining work: [docs/superpowers/specs/2026-11-03-camera-source-recovery-design.md](../docs/superpowers/specs/2026-11-03-camera-source-recovery-design.md) §8 순서대로 서버 체크아웃에서 구현(`camera_runtime.py` 정책 → `preview.py` 재설정 → 테스트 → operations.md 갱신).
+- Verification pending: CPU 테스트(`test_camera_*.py`, `test_rtsp_inputs.py`) 추가·통과, GPU 서버 수동 검증(설계 문서 §6). 배포는 사용자 확인 후.
+- Blockers: none. `nvurisrcbin` 7.0 내부 동작은 Not verified이며 설계는 이에 의존하지 않는다.
+- Next action: 서버 에이전트가 설계 문서를 읽고 §8 1단계(camera_runtime 정책 + 테스트)부터 구현한다.
+
+## 원인 조사 결과 (2026-11-03, 서버 96시간 로그)
+
+- 끊긴 카메라 6대 모두 장애 후 세대 주기가 60초로 bus 메시지 없이 앱 watchdog만 돌았다(source bin 침묵). 경로는 두 가지: 디코더 WARNING 후 침묵(b1_parking_gate), not-negotiated WARNING → RTSP timeout 1회 → 침묵(3f_auditorium_door, 6f_office_inner, b1_parking_overview, 6f_lobby). 상세와 배제된 가설은 설계 문서 §1.
+- 서버 체크아웃의 `.ai/WORK.md` 로컬 사본에 서버 에이전트의 조사 기록("Current RTSP/output investigation" 절)이 있을 수 있다. pull 전에 비교해 이 절과 합친다.
 
 ## Important context
 
