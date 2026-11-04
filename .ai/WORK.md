@@ -1,13 +1,17 @@
 # Current work (server / pipeline / backend)
 
 - Active task: 카메라 source bin 자동 복구 (일부 카메라가 침묵 상태로 영구 offline, 재시작만 통하는 문제)
-- Status: 구현 완료, **main 0ef8320에 반영됨(push 완료, 2026-11-03)**. 설계 문서 §8 1~4단계 완료. 운영 컨테이너에는 아직 적용되지 않음(배포·재시작 안 함). 작업 브랜치와 옛 worktree(`retrace-dataset-369ed49`, `retrace-model-deploy`)는 정리했다.
+- Status: 1단계(source bin 제자리 재설정) 구현 완료, **main 0ef8320에 반영·운영 적용됨(2026-11-03)**. 하루 운영 결과 두 경로 중 한 경로만 복구된다(아래 "운영 결과"). **2단계 복구(mux sink pad release/재요청 + source bin 재생성) 설계 문서가 main에 추가되면 구현할 예정**. 작업 브랜치와 옛 worktree(`retrace-dataset-369ed49`, `retrace-model-deploy`)는 정리했다.
+- 운영 결과 (2026-11-04, 1일, 사용자 보고):
+  - 복구 성공: RTSP timeout 후 침묵 경로 — 6f_lobby, 1f_lobby. 재설정(`source_reset`) 후 프레임이 돌아왔다.
+  - 복구 실패: not-negotiated 후 침묵 경로 — b1_parking_overview, 7f_lobby. 재설정 직후 공유 element 경고 4건 → source 경고 1건이 반복되고 프레임은 돌아오지 않는다. bin 전체 NULL → PLAYING만으로는 기존 mux sink pad/caps 협상 상태가 풀리지 않는 것으로 보인다(원인은 Not verified; 경고 원문은 기록하지 않음).
+  - 판단: 설계 문서 §5 후속 과제(재설정 후 caps 오류 반복) 조건이 충족됐다. 다음 단계는 mux sink pad를 release하고 다시 request하면서 source bin을 재생성하는 2단계 복구다. 1단계 재설정은 유지한다(timeout 경로에 유효).
 - Changed (commit 0ef8320): `camera_runtime.py`(`CameraStatus.recovery_count`, `RECOVERY_BACKOFF`, `recovery_due/begin_recovery/recovery_failed`, manager `recovery_enabled`·`tick()`이 due slot 반환·`recovered/recovery_failed`), `preview.py`(`--source-recovery` 기본 켬, `source_bins` 보관, `reset_source()` NULL → sync_state_with_parent, 제어 루프에서 tick당 1대, `source_reset`/`source_reset_failed` 로그), tests(`test_camera_runtime.py` RecoveryPolicyTests 6, `test_camera_shared_pipeline.py` tick 2 + fake Gst 제어 루프 3 + 스키마 키, `test_rtsp_inputs.py` 파서 1), docs(operations.md "source 복구 정책", architecture.md, testing.md, 설계 문서 상태·구현 메모).
 - 설계와 다른 점(설계 문서 "구현 메모" 참조): ghost pad target은 plugin이 pad-removed 없이 pad를 버린 경우에만 비운다(무조건 비우면 pad가 유지되는 경우 링크가 끊김). `recovery_failed()`도 간격을 120→300→600으로 늘린다.
 - Verified (CPU, `/tmp/retrace-shared-venv/bin/python` 3.11): `test_camera_*.py` 75 OK, `test_rtsp_inputs.py` 6 OK, 회귀 `test_preview_realtime` 11, `test_vehicle_deployment` 24, `test_canonical_startup` 3, `test_preview_api_writes` 15 OK. `git diff --check` 통과.
-- NOT verified: DS 7.0 실환경에서 `source-bin-N` NULL → PLAYING 후 nvurisrcbin이 pad를 유지/재추가하는지, 재설정 후 legacy nvstreammux caps 재협상, 다른 카메라 fps 영향. 설계 문서 §6 "GPU 서버 검증" 절차로 확인한다.
-- Next action: 재시작 가능한 시간에 `sudo docker compose restart retrace`(bind mount라 코드만 반영) → §6 GPU 검증(카메라 1대 RTSP 3분 차단 후 복구, `source_reset` 로그와 `recovery_count` 확인, 다른 카메라 fps 유지) → 며칠 운영 후 `docker compose logs -t | rg 'source_reset|source_caps_error'`로 재설정 후 caps 오류 반복 여부 확인(§5 후속 과제 판단).
-- Blockers: none. `nvurisrcbin` 7.0 내부 동작은 Not verified이며 설계는 이에 의존하지 않는다.
+- NOT verified: not-negotiated 경로에서 재설정이 실패하는 정확한 지점(nvurisrcbin 내부 caps 상태인지, legacy nvstreammux sink pad의 협상 상태인지), 재설정이 다른 카메라 fps에 준 영향(사용자 보고에 없음).
+- Next action: 2단계 복구 설계 문서(`docs/superpowers/specs/`에 추가 예정, mux sink pad release/재요청 + source bin 재생성)가 main에 들어오면 그 문서 순서대로 테스트 먼저 작성 → 구현 → CPU 테스트(`/tmp/retrace-shared-venv/bin/python -m unittest discover -s tests -p 'test_camera_*.py'`). 그때까지 운영 로그에서 `source_reset` 뒤 경고 반복 패턴을 `docker compose logs -t | rg 'source_reset|source_caps_error'`로 계속 수집한다.
+- Blockers: 2단계 설계 문서 미작성. `nvurisrcbin` 7.0 내부 동작은 Not verified이며 설계는 이에 의존하지 않는다.
 
 ## 원인 조사 결과 (2026-11-03, 서버 96시간 로그)
 
