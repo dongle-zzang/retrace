@@ -1,7 +1,7 @@
 # Current work (server / pipeline / backend)
 
 - Active task: 카메라 source bin 자동 복구 (일부 카메라가 침묵 상태로 영구 offline, 재시작만 통하는 문제)
-- Status: 1단계(source bin 제자리 재설정) 구현 완료, **main 0ef8320에 반영·운영 적용됨(2026-11-03)**. 하루 운영 결과 두 경로 중 한 경로만 복구된다(아래 "운영 결과"). **2단계 복구(mux sink pad release/재요청 + source bin 재생성) 설계 문서가 main에 추가되면 구현할 예정**. 작업 브랜치와 옛 worktree(`retrace-dataset-369ed49`, `retrace-model-deploy`)는 정리했다.
+- Status: 1단계(source bin 제자리 재설정) 구현 완료, **main 0ef8320에 반영·운영 적용됨(2026-11-03)**. 하루 운영 결과 두 경로 중 한 경로만 복구된다(아래 "운영 결과"). **2단계 복구(mux sink pad release/재요청 + source bin 재생성) 설계 문서 작성 완료(2026-11-04), 구현 대기**. 작업 브랜치와 옛 worktree(`retrace-dataset-369ed49`, `retrace-model-deploy`)는 정리했다.
 - 운영 결과 (2026-11-04, 1일, 사용자 보고):
   - 복구 성공: RTSP timeout 후 침묵 경로 — 6f_lobby, 1f_lobby. 재설정(`source_reset`) 후 프레임이 돌아왔다.
   - 복구 실패: not-negotiated 후 침묵 경로 — b1_parking_overview, 7f_lobby. 재설정 직후 공유 element 경고 4건 → source 경고 1건이 반복되고 프레임은 돌아오지 않는다. bin 전체 NULL → PLAYING만으로는 기존 mux sink pad/caps 협상 상태가 풀리지 않는 것으로 보인다(원인은 Not verified; 경고 원문은 기록하지 않음).
@@ -10,8 +10,8 @@
 - 설계와 다른 점(설계 문서 "구현 메모" 참조): ghost pad target은 plugin이 pad-removed 없이 pad를 버린 경우에만 비운다(무조건 비우면 pad가 유지되는 경우 링크가 끊김). `recovery_failed()`도 간격을 120→300→600으로 늘린다.
 - Verified (CPU, `/tmp/retrace-shared-venv/bin/python` 3.11): `test_camera_*.py` 75 OK, `test_rtsp_inputs.py` 6 OK, 회귀 `test_preview_realtime` 11, `test_vehicle_deployment` 24, `test_canonical_startup` 3, `test_preview_api_writes` 15 OK. `git diff --check` 통과.
 - NOT verified: not-negotiated 경로에서 재설정이 실패하는 정확한 지점(nvurisrcbin 내부 caps 상태인지, legacy nvstreammux sink pad의 협상 상태인지), 재설정이 다른 카메라 fps에 준 영향(사용자 보고에 없음).
-- Next action: 2단계 복구 설계 문서(`docs/superpowers/specs/`에 추가 예정, mux sink pad release/재요청 + source bin 재생성)가 main에 들어오면 그 문서 순서대로 테스트 먼저 작성 → 구현 → CPU 테스트(`/tmp/retrace-shared-venv/bin/python -m unittest discover -s tests -p 'test_camera_*.py'`). 그때까지 운영 로그에서 `source_reset` 뒤 경고 반복 패턴을 `docker compose logs -t | rg 'source_reset|source_caps_error'`로 계속 수집한다.
-- Blockers: 2단계 설계 문서 미작성. `nvurisrcbin` 7.0 내부 동작은 Not verified이며 설계는 이에 의존하지 않는다.
+- Next action: 2단계 복구 설계 문서 [docs/superpowers/specs/2026-11-04-camera-source-rebuild-design.md](../docs/superpowers/specs/2026-11-04-camera-source-rebuild-design.md) §8 순서대로 서버 체크아웃에서 테스트 먼저 작성 → 구현 → CPU 테스트(`/tmp/retrace-shared-venv/bin/python -m unittest discover -s tests -p 'test_camera_*.py'`). 핵심: 두 번째 복구부터 mux `sink_N` release/재요청 + source bin 재생성(`attach_source` 분리), demux `src_N` EOS DROP 프로브, WARNING 로그에 `factory`, `--no-source-recovery-rebuild`.
+- Blockers: none. `nvurisrcbin` 7.0 내부 동작과 재설정을 거부하는 element(nvstreammux인지 tracker인지)는 Not verified이며 설계는 이에 의존하지 않는다(재생성 후 `factory` 로그로 확정 예정).
 
 ## 원인 조사 결과 (2026-11-03, 서버 96시간 로그)
 
