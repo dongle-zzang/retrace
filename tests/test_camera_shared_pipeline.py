@@ -231,6 +231,15 @@ class SharedTests(unittest.TestCase):
         manager.recovery_failed(0)
         self.assertEqual(manager.runtimes[0].snapshot().last_error, 'pipeline_error')
 
+    def test_manager_recovery_mode_follows_each_slot(self):
+        manager = self.manager()
+        self.silence(manager, 0)
+        self.now += 5
+        self.assertEqual([manager.recovery_mode(slot) for slot in (0, 1)], ['reset', 'reset'])
+        self.assertEqual(manager.tick(), [0])
+        manager.recovered(0)
+        self.assertEqual([manager.recovery_mode(slot) for slot in (0, 1)], ['rebuild', 'reset'])
+
     def test_tick_without_recovery_keeps_observation_only_retries(self):
         manager = self.manager(recovery_enabled=False)
         self.silence(manager, 0)
@@ -282,6 +291,20 @@ class SharedTests(unittest.TestCase):
             self.construct(2, diagnostics=True)
             self.construct(3, diagnostics=True, vehicle_enabled=True)
 
+    def test_demux_branch_drops_eos_so_a_rebuilt_source_can_resume_output(self):
+        run = self.construct(2)
+        for index in range(2):
+            downstream = [args for args in run['callbacks'][('stream-demuxer', f'src_{index}')] if args[0] == 2]
+            self.assertEqual(len(downstream), 1)  # one EVENT_DOWNSTREAM probe per demux src pad
+            _mask, probe, *extra = downstream[0]
+            self.assertEqual(probe(None, NS(get_event=lambda: NS(type='EOS')), *extra), 'DROP')
+            self.assertEqual(probe(None, NS(get_event=lambda: NS(type='CAPS')), *extra), 'OK')
+            self.assertEqual(probe(None, NS(get_event=lambda: None), *extra), 'OK')
+        # Source EOS keeps failing the camera before the mux, as before.
+        _mask, probe, *extra = [args for args in run['callbacks'][('source-bin-0', 'src')] if args[0] == 2][0]
+        self.assertEqual(probe(None, NS(get_event=lambda: NS(type='EOS')), *extra), 'DROP')
+        self.assertEqual(run['manager'].runtimes[0].snapshot().last_error, 'source_eos')
+
     def test_control_loop_resets_only_the_due_source_bin_in_place(self):
         run = self.construct(2, reset={'slot': 0, 'ticks': 2})
         source, other = run['elements']['source-bin-0'], run['elements']['source-bin-1']
@@ -310,25 +333,111 @@ class SharedTests(unittest.TestCase):
         self.assertEqual(run['pops'], 3)
         self.assertEqual(run['elements']['preview-detection'].states, ['PLAYING', 'NULL'])
 
-    def construct(self, count, diagnostics=False, vehicle_enabled=False, reset=None):
+    REBUILD = ('set_state', 'get_state', 'event', 'unlink', 'release', 'remove', 'create', 'add', 'request', 'link', 'sync')
+
+    def rebuild_ops(self, run, start=0):
+        """Recovery operations after the pipeline went PLAYING, in order."""
+        ops = run['ops']
+        playing = ops.index(('set_state', 'preview-detection', 'PLAYING'))
+        stopped = ops.index(('set_state', 'preview-detection', 'NULL'))
+        return [op for op in ops[playing + 1:stopped] if op[0] in self.REBUILD][start:]
+
+    def test_control_loop_rebuilds_the_source_on_its_second_recovery(self):
+        # 5 s per tick: reset at the first due tick, no_frames 30 s later, rebuild once 120 s have passed.
+        run = self.construct(2, reset={'slot': 0, 'ticks': 30, 'step': 5})
+        bins = [e for e in run['all_elements'] if e.name == 'source-bin-0']
+        self.assertEqual(len(bins), 2)  # startup bin, rebuilt bin
+        old, new = bins
+        self.assertEqual(self.rebuild_ops(run), [
+            ('set_state', 'source-bin-0', 'NULL'), ('sync', 'source-bin-0'),  # recovery 1: in-place reset
+            ('set_state', 'source-bin-0', 'NULL'),  # recovery 2: rebuild
+            ('event', 'stream-muxer', 'sink_0', ('flush_stop', False)),
+            ('unlink', 'source-bin-0', 'stream-muxer', 'sink_0'),
+            ('release', 'stream-muxer', 'sink_0'),
+            ('remove', 'preview-detection', 'source-bin-0'),
+            ('create', 0),
+            ('add', 'preview-detection', 'source-bin-0'),
+            ('request', 'stream-muxer', 'sink_0'),
+            ('link', 'source-bin-0', 'sink_0'),
+            ('sync', 'source-bin-0')])
+        self.assertEqual((old.states, old.synced, new.states, new.synced), (['NULL', 'NULL'], 1, [], 1))
+        self.assertEqual(run['elements']['source-bin-1'].states, [])
+        self.assertEqual(run['probes'].count(('source-bin-0', 'src')), run['probes'].count(('source-bin-1', 'src')) * 2)
+        self.assertEqual([r for r in run['released'] if r == ('stream-muxer', 'sink_0')], [('stream-muxer', 'sink_0')] * 2)
+        self.assertEqual(run['released'].count(('stream-muxer', 'sink_1')), 1)
+        status = run['manager'].runtimes[0].snapshot()
+        self.assertEqual((status.state, status.recovery_count), ('reconnecting', 2))
+        self.assertEqual(run['manager'].runtimes[1].snapshot().state, 'degraded')  # 0.2 fps in the loop, never failed
+        lines = run['captured'].splitlines()
+        self.assertEqual(sum(l.startswith('source_reset ') for l in lines), 1)
+        self.assertIn('source_rebuild {"camera_id":"camera_0","source_id":0,"generation":%d,"recovery_count":2}'
+                      % status.generation, lines)
+
+    def test_control_loop_retries_rebuild_from_creation_after_a_request_failure(self):
+        # The second sink_0 request (first rebuild) fails; the next rebuild 600 s later starts at creation.
+        run = self.construct(2, reset={'slot': 0, 'ticks': 170, 'step': 5, 'fail_request': ('sink_0', 2)})
+        ops = self.rebuild_ops(run, start=2)
+        self.assertEqual(ops[:9], [
+            ('set_state', 'source-bin-0', 'NULL'), ('event', 'stream-muxer', 'sink_0', ('flush_stop', False)),
+            ('unlink', 'source-bin-0', 'stream-muxer', 'sink_0'), ('release', 'stream-muxer', 'sink_0'),
+            ('remove', 'preview-detection', 'source-bin-0'), ('create', 0), ('add', 'preview-detection', 'source-bin-0'),
+            ('request', 'stream-muxer', 'sink_0'),
+            ('remove', 'preview-detection', 'source-bin-0')])  # the unlinked new bin leaves the pipeline
+        self.assertEqual(ops[9:], [('create', 0), ('add', 'preview-detection', 'source-bin-0'),
+                                   ('request', 'stream-muxer', 'sink_0'), ('link', 'source-bin-0', 'sink_0'),
+                                   ('sync', 'source-bin-0')])
+        lines = run['captured'].splitlines()
+        self.assertIn('source_rebuild_failed {"camera_id":"camera_0","source_id":0,"stage":"request"}', lines)
+        self.assertEqual(sum(l.startswith('source_rebuild ') for l in lines), 1)
+        self.assertEqual(run['released'].count(('stream-muxer', 'sink_0')), 2)
+        self.assertEqual(run['manager'].runtimes[0].snapshot().recovery_count, 2)  # one reset, one rebuild
+
+    def test_control_loop_gives_up_a_rebuild_whose_bin_never_reaches_null(self):
+        run = self.construct(2, reset={'slot': 0, 'ticks': 30, 'step': 5, 'result': 'ASYNC',
+                                       'get_state': ('ASYNC', 'READY', 'NULL')})
+        self.assertEqual(self.rebuild_ops(run)[2:], [('set_state', 'source-bin-0', 'NULL'),
+                                                     ('get_state', 'source-bin-0', 5000)])
+        self.assertIn('source_rebuild_failed {"camera_id":"camera_0","source_id":0,"stage":"null"}',
+                      run['captured'].splitlines())
+        self.assertEqual(run['released'].count(('stream-muxer', 'sink_0')), 1)
+
+    def test_control_loop_keeps_resetting_in_place_when_rebuild_is_disabled(self):
+        run = self.construct(2, reset={'slot': 0, 'ticks': 30, 'step': 5}, rebuild_enabled=False)
+        self.assertEqual(self.rebuild_ops(run), [('set_state', 'source-bin-0', 'NULL'), ('sync', 'source-bin-0')] * 2)
+        self.assertEqual(run['manager'].recovery_mode(0), 'rebuild')
+        self.assertEqual(sum(l.startswith('source_reset ') for l in run['captured'].splitlines()), 2)
+        self.assertNotIn('source_rebuild', run['captured'])
+
+    def construct(self, count, diagnostics=False, vehicle_enabled=False, reset=None, rebuild_enabled=True):
         manager = self.manager(count)
-        elements, released, links, probes, retargets = [], [], [], [], []
+        test = self  # the fake bus below runs inside Element methods, where self is the element
+        elements, released, links, probes, retargets, callbacks, ops = [], [], [], [], [], {}, []
         pops = [0]
+        requests = {}
         shutdown = threading.Event()
         if reset is None:
             shutdown.set()
         else:
             self.silence(manager, reset['slot'])
             self.now += 5
+            other = 1 - reset['slot']
 
         class Pad:
             def __init__(self, owner, name):
                 self.owner, self.name = owner, name
             def add_probe(self, *args):
                 probes.append((self.owner, self.name))
+                callbacks.setdefault((self.owner, self.name), []).append(args)
             def link(self, pad):
                 links.append((self.owner, self.name, pad.owner, pad.name))
+                ops.append(('link', self.owner, pad.name))
                 return 'OK'
+            def unlink(self, pad):
+                ops.append(('unlink', self.owner, pad.owner, pad.name))
+                return True
+            def send_event(self, event):
+                ops.append(('event', self.owner, self.name, event))
+                return True
             def get_target(self):
                 return NS(get_parent=lambda: (reset or {}).get('pad_parent', 'decoder'))
             def set_target(self, target):
@@ -349,11 +458,23 @@ class SharedTests(unittest.TestCase):
                 return Pad(self.name, name)
             def request_pad_simple(self, name):
                 self.requests.append(name)
+                ops.append(('request', self.name, name))
+                requests[name] = requests.get(name, 0) + 1
+                if reset is not None and requests[name] == reset.get('fail_request', (None, 0))[1] \
+                        and name == reset['fail_request'][0]:
+                    return None
                 return Pad(self.name, name)
             def release_request_pad(self, pad):
                 released.append((self.name, pad.name))
+                ops.append(('release', self.name, pad.name))
             def add(self, element):
-                pass
+                ops.append(('add', self.name, element.name))
+            def remove(self, element):
+                ops.append(('remove', self.name, element.name))
+                return True
+            def get_state(self, timeout):
+                ops.append(('get_state', self.name, timeout))
+                return (reset or {}).get('get_state', ('SUCCESS', 'NULL', 'VOID_PENDING'))
             def link(self, element):
                 links.append((self.name, 'src', element.name, 'sink'))
                 return True
@@ -362,30 +483,42 @@ class SharedTests(unittest.TestCase):
             def get_bus(self):
                 def timed_pop_filtered(*args):
                     pops[0] += 1
+                    if reset is not None and reset.get('step'):
+                        # Time passes between ticks; the healthy camera keeps decoding.
+                        test.now = round(test.now + reset['step'], 1)
+                        pts = int(test.now * 1000)
+                        manager.observe_decoded(other, pts)
+                        manager.publish(other, pts, lambda: None, output=True)
                     if reset is not None and pops[0] >= reset['ticks']:
                         shutdown.set()
                     return None
                 return NS(set_sync_handler=lambda *args: None, timed_pop_filtered=timed_pop_filtered)
             def set_state(self, state):
                 self.states.append(state)
+                ops.append(('set_state', self.name, state))
                 if self.factory == 'source' and reset is not None:
                     return reset.get('result', 'SUCCESS')
                 return 'SUCCESS'
             synced = 0
             def sync_state_with_parent(self):
                 self.synced += 1
+                ops.append(('sync', self.name))
                 return True
 
         namespace = {'Gst': NS(Pipeline=NS(new=lambda name: Element('pipeline', name)),
                          Caps=NS(from_string=lambda caps: caps), PadProbeType=NS(BUFFER=1, EVENT_DOWNSTREAM=2),
                          PadLinkReturn=NS(OK='OK'), State=NS(PLAYING='PLAYING', NULL='NULL'), MSECOND=1,
-                         StateChangeReturn=NS(FAILURE='FAILURE'), MessageType=NS(ERROR=1, WARNING=2, EOS=4,
+                         EventType=NS(EOS='EOS'), PadProbeReturn=NS(OK='OK', DROP='DROP'), SECOND=1000,
+                         Event=NS(new_flush_stop=lambda reset_time: ('flush_stop', reset_time)),
+                         StateChangeReturn=NS(FAILURE='FAILURE', ASYNC='ASYNC', SUCCESS='SUCCESS'),
+                         MessageType=NS(ERROR=1, WARNING=2, EOS=4,
                                                 ELEMENT=8, STATE_CHANGED=16), debug_set_active=lambda *args: None,
                          init=lambda *args: None), 'os': NS(environ={}), 'threading': threading,
                      'time': __import__('time'), 'json': __import__('json'),
                      'configure_pgie': configure_pgie,
                      'make_element': Element, 'make_tracker': lambda: Element('nvtracker', 'vehicle-tracker'),
-                     'create_preview_source_bin': lambda index, *args, **kwargs: Element('source', f'source-bin-{index}'),
+                     'create_preview_source_bin': lambda index, *args, **kwargs: (
+                         ops.append(('create', index)) or Element('source', f'source-bin-{index}')),
                      'build_output': lambda index, *args: Element('output', f'mjpeg-source-{index}')}
         namespace.update(FrameTiming=FrameTiming, source_observer=lambda *args: lambda *args: None,
                          bus_observer=lambda *args: lambda *args: None,
@@ -396,7 +529,7 @@ class SharedTests(unittest.TestCase):
         namespace = load_preview({'run_shared_pipeline', 'CameraFrameSink'}, namespace)
         args = NS(cameras=list(manager.cameras_by_slot.values()), input=['private'] * count,
                   diagnostics=diagnostics, mux_live_source=1, rtsp_latency=1000, rtsp_drop_on_latency=False,
-                  camera_offline_after=10)
+                  camera_offline_after=10, source_recovery_rebuild=rebuild_enabled)
         if diagnostics:
             args.startup_timing = StartupTiming(args.cameras, 0, 'test')
         captured = io.StringIO()
@@ -442,9 +575,10 @@ class SharedTests(unittest.TestCase):
             self.assertIn('vehicle cameras=0 vehicle batch-size=0', captured.getvalue())
         self.assertEqual(mux.props['batched-push-timeout'], 33333)
         self.assertFalse(mux.props['sync-inputs'])
-        self.assertEqual(mux.requests, [f'sink_{i}' for i in range(count)])
+        self.assertEqual(mux.requests[:count], [f'sink_{i}' for i in range(count)])  # rebuilds re-request later
         self.assertEqual(demux.requests, [f'src_{i}' for i in range(count)])
-        self.assertEqual(len(released), count * 2)
+        if reset is None:
+            self.assertEqual(len(released), count * 2)
         self.assertFalse(any(e.factory in ('queue', 'nvvideoconvert', 'capsfilter') for e in elements))
         self.assertEqual((mux.props['width'], mux.props['height']), (1920, 1080))
         for i in range(count):
@@ -453,7 +587,8 @@ class SharedTests(unittest.TestCase):
         self.assertIn(f'sources={count} streammux batch-size={count} vehicle', captured.getvalue())
         self.assertNotIn('private', captured.getvalue())
         return {'elements': {e.name: e for e in elements}, 'captured': captured.getvalue(), 'manager': manager,
-                'retargets': retargets, 'pops': pops[0]}
+                'retargets': retargets, 'pops': pops[0], 'callbacks': callbacks, 'ops': ops,
+                'released': released, 'all_elements': elements, 'probes': probes}
 
     def test_bus_source_error_and_eos_do_not_stop_shared_pipeline(self):
         tree = ast.parse((ROOT / 'preview.py').read_text())
@@ -473,6 +608,29 @@ class SharedTests(unittest.TestCase):
         namespace['on_message'](None, NS(type=1, source='all'))
         self.assertEqual(calls[-1], ('pipeline_error', True, 'all'))
 
+    def test_bus_warning_names_the_validated_factory_in_diagnostics(self):
+        from rtsp_diagnostics import classify_bus_error, safe_factory
+        tree = ast.parse((ROOT / 'preview.py').read_text())
+        function = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'on_message')
+        namespace = {'Gst': NS(MessageType=NS(ERROR=1, WARNING=2, EOS=3, ELEMENT=4, STATE_CHANGED=5)),
+                     'message_scope': lambda message: (message.source, 'rtsp_error' if message.source != 'all' else 'pipeline_error'),
+                     'stop': lambda *args: self.fail('warnings never stop anything'),
+                     'classify_bus_error': classify_bus_error, 'safe_factory': safe_factory,
+                     'manager': NS(record_error_reason=lambda *args: False),
+                     'args': NS(diagnostics=True)}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), 'preview.py', 'exec'), namespace)
+        error = NS(domain='gst-core-error-quark', code=10, message='private')
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            for source, name in (('all', 'nvstreammux'), ('1', 'rtspsrc'), ('all', 'Bad Name')):
+                namespace['on_message'](None, NS(type=2, source=source, parse_warning=lambda: (error, 'private'),
+                                                 src=NS(get_factory=lambda: NS(get_name=lambda: name))))
+        self.assertEqual(captured.getvalue().splitlines(),
+                         ['pipeline_source=all: GStreamer WARNING factory=nvstreammux; details hidden',
+                          'pipeline_source=1: GStreamer WARNING factory=rtspsrc; details hidden',
+                          'pipeline_source=all: GStreamer WARNING factory=other; details hidden'])
+        self.assertNotIn('private', captured.getvalue())
+
     def test_bus_ancestor_maps_source_and_output_errors_separately(self):
         tree = ast.parse((ROOT / 'preview.py').read_text())
         function = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'message_scope')
@@ -480,6 +638,8 @@ class SharedTests(unittest.TestCase):
         exec(compile(ast.Module(body=[function], type_ignores=[]), 'preview.py', 'exec'), namespace)
         def element(name, parent=None):
             return NS(get_name=lambda: name, get_parent=lambda: parent)
+        # A bin already removed from the pipeline (no parent) still resolves by name: a late
+        # message from the old bin during a rebuild fails that slot instead of the whole pipeline.
         self.assertEqual(namespace['message_scope'](NS(src=element('rtsp', element('source-bin-1')))),
                          ('1', 'rtsp_error'))
         self.assertEqual(namespace['message_scope'](NS(src=element('encoder', element('mjpeg-source-1')))),

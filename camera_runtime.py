@@ -208,6 +208,11 @@ class CameraRuntime:
             return (not self._running and self._frameless_attempts >= 2
                     and self.clock() >= self._recovery_not_before)
 
+    def recovery_mode(self):
+        """'reset' for the first recovery since the last stable period, 'rebuild' afterwards."""
+        with self._lock:
+            return 'reset' if self._recoveries == 0 else 'rebuild'
+
     def _defer_recovery(self):
         self._recoveries += 1
         self._recovery_not_before = self.clock() + RECOVERY_BACKOFF[min(self._recoveries - 1, len(RECOVERY_BACKOFF) - 1)]
@@ -307,6 +312,9 @@ class CameraRuntimeManager:
                         # No element creation or state change: nvurisrcbin owns RTSP retry.
                         runtime.begin_attempt()
         return due
+
+    def recovery_mode(self, slot):
+        return self.runtimes[self.cameras_by_slot[slot].source_id].recovery_mode()
 
     def recovered(self, slot):
         return self.runtimes[self.cameras_by_slot[slot].source_id].begin_recovery()

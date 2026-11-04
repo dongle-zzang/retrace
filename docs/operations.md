@@ -201,8 +201,9 @@ last_frame_age/output_frame_age는 monotonic 시간 기반 경과 초입니다.
 추가 decoder surface 4개를 nvurisrcbin 속성으로 설정합니다. 내부 child 속성을 재설정하지 않으며,
 child-added는 diagnostics/probe 관측 시에만 연결합니다. 지연 초과 드롭을 끄려면
 `--no-rtsp-drop-on-latency`를 사용합니다. source별 decoder는 필요하지만 inference/tracker는 각각 하나입니다.
-source bin이나 mux pad를 제거/재생성하지 않으며, 침묵한 source bin만 제자리에서 NULL → PLAYING으로
-재설정합니다(아래 복구 정책). 주소/credential은 시작 시 읽은 값을 재사용합니다. **기존 worker와 달리 실행 중 .env 변경을 재연결 시 다시 읽지 않습니다.**
+침묵한 source bin은 먼저 제자리에서 NULL → PLAYING으로 재설정하고, 그래도 돌아오지 않으면 그 source bin과
+mux sink pad만 제거하고 다시 만듭니다(아래 복구 정책). mux/tracker/demux와 다른 카메라는 그대로입니다.
+주소/credential은 시작 시 읽은 값을 재사용합니다. **기존 worker와 달리 실행 중 .env 변경을 재연결 시 다시 읽지 않습니다.**
 `.env` 또는 enabled 카메라 목록 변경 후 컨테이너를 재생성해 환경변수와 batch-size를 함께 갱신하세요.
 `--input`으로 지정한 카메라는 명시 URI를 유지합니다.
 
@@ -224,6 +225,21 @@ nvurisrcbin이 RTSP 연결과 디코더를 다시 만듭니다. ghost pad target
 증가하고 `source_reset {camera_id, source_id, generation, recovery_count}` 한 줄을 항상 출력합니다. 재설정
 자체가 실패하면 `source_reset_failed {camera_id, source_id, stage}`를 남기고 last_error=pipeline_error로 다음
 간격까지 미루며 일반 관측 재시도는 계속됩니다. `--no-source-recovery`로 끄면 기존 관측 재시도만 수행합니다.
+
+마지막 안정 수신 이후 두 번째 복구부터는 제자리 재설정 대신 **재생성**합니다(NVIDIA
+`runtime_source_add_delete` 샘플 순서): `source-bin-N`을 NULL(ASYNC면 최대 5초 대기) → mux `sink_N`에
+flush-stop → unlink → `release_request_pad` → pipeline에서 제거 → 같은 이름의 bin을 새로 만들어 프로브를 다시
+붙이고 `sink_N`을 다시 요청해 연결 → 부모와 동기화. not-negotiated를 겪은 mux sink pad의 협상 상태가 재설정만으로는
+풀리지 않는 경우(2026-11-04 운영 결과)를 위한 것이며 slot/source_id/demux `src_N`/JPEG branch는 유지됩니다. 성공 시
+`source_rebuild {camera_id, source_id, generation, recovery_count}`, 실패 시 `source_rebuild_failed {camera_id,
+source_id, stage}`(stage는 null/create/request/link/sync)를 출력합니다. NULL 단계 실패는 bin을 그대로 두고, 그 뒤
+단계의 실패는 slot을 비워 두었다가 다음 간격에 생성부터 다시 시도합니다(그동안 그 카메라만 offline).
+`recovery_count`는 재설정과 재생성을 함께 셉니다. mux pad 제거가 하류로 보낼 수 있는 EOS가 JPEG branch를 영구
+정지시키지 않도록 demux `src_N`에서 EOS만 DROP합니다. `--no-source-recovery-rebuild`로 끄면 두 번째 복구부터도
+제자리 재설정만 반복합니다(`--no-source-recovery`면 둘 다 꺼짐). diagnostics 모드의
+`pipeline_source=X: GStreamer WARNING factory=<plugin>; details hidden` 줄은 경고를 낸 element의 factory 이름
+(`[a-z0-9_]{1,32}` 외는 `other`)을 함께 적어 재생성 직후 어느 공유 element가 거부하는지 확인하는 데 씁니다.
+`source_rtsp` JSON에도 같은 `factory` 필드가 실립니다.
 
 기존 `/streams.json`에 runtime 객체를 추가합니다. 호환 status는 connected/starting을 유지하고
 실제 상태는 runtime.state로 확인합니다. `run(..., runtime_statuses={})`에 전달한 dict에는

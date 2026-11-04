@@ -2,6 +2,7 @@
 
 상태: 구현됨 (2026-11-03, 서버 체크아웃, 브랜치 `claude/camera-source-recovery`). CPU 테스트 통과, GPU 검증(§6)과 배포는 대기.
 운영 설명 본문은 [docs/operations.md](../../operations.md) "카메라 runtime lifecycle"의 "source 복구 정책"으로 옮겼다.
+후속: 재설정으로 돌아오지 않는 경로(not-negotiated 후 침묵)는 [2026-11-04 2단계 복구 설계](2026-11-04-camera-source-rebuild-design.md)가 다룬다.
 
 구현 메모(설계와 다른 점):
 

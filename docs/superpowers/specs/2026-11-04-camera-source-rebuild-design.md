@@ -1,6 +1,20 @@
 # 카메라 source 2단계 복구(mux pad 재생성) 설계 (2026-11-04)
 
-상태: 설계 승인됨, 구현 대기. 구현과 GPU 검증은 서버 체크아웃에서 수행한다.
+상태: 구현됨 (2026-11-04, 서버 체크아웃). CPU 테스트 통과, 배포와 GPU 검증(§6)은 대기.
+
+구현 메모(설계와 다른 점):
+
+- §4-2 `attach_source()`는 `create_preview_source_bin` 예외를 감싸지 않는다(기동 실패 로그의 예외 type 이름을 유지).
+  request/link 실패만 `SourceAttachError(stage)`로 올리므로 기동 중 그 두 실패의 setup 로그 type은
+  `RuntimeError`에서 `SourceAttachError`로 바뀐다. `rebuild_source()`는 그 외 예외를 stage `create`로 기록한다.
+- §4-2 재생성 중 request/link/sync 실패 뒤에는 부분적으로 붙은 새 bin과 요청된 pad를 `detach_source()`로 바로
+  정리해 slot을 비운다(설계대로 다음 복구는 생성부터 시작). 분리 순서(flush-stop → unlink → release → remove)는
+  2단계와 같은 함수다.
+- 제어 루프는 `source_bins[slot]`이 비어 있으면 `recovery_mode`와 무관하게 재생성한다(비어 있는 slot은 재설정할 bin이 없다).
+- §4-4 `factory` 검증은 `rtsp_diagnostics.safe_factory()`로 두고 `classify_bus_error()`와 WARNING 로그가 함께 쓴다.
+  WARNING 줄 형식은 `pipeline_source=X: GStreamer WARNING factory=<값>; details hidden`이다.
+- §6 fake Gst 테스트는 bus pop마다 5초씩 시계를 진행해 재설정(복구 1) → 120초 뒤 재생성(복구 2) 순서를 실제
+  정책 코드로 만든다. 요청 실패 테스트는 두 번째 `sink_0` 요청만 None으로 만들어 600초 뒤 생성부터 재시도함을 본다.
 전제: [2026-11-03 1단계 설계](2026-11-03-camera-source-recovery-design.md)와 그 구현(main 0ef8320: `camera_runtime.py`
 `recovery_due/begin_recovery/recovery_failed`, `preview.py` `reset_source()`). 이 문서는 그 위에 한 단계를 더 얹는다.
 관련 코드: `preview.py`, `camera_runtime.py`, `app.py`, `rtsp_diagnostics.py`. 관련 문서: [docs/operations.md](../../operations.md) "source 복구 정책".

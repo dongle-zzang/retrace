@@ -8,6 +8,7 @@ DOMAINS = {'gst-resource-error-quark': 'resource', 'gst-stream-error-quark': 'st
            'gst-core-error-quark': 'core', 'gst-library-error-quark': 'library',
            'g-io-error-quark': 'io'}
 CODECS = frozenset({'H264', 'H265', 'JPEG', 'VP8', 'VP9', 'MP4V-ES'})
+FACTORY_NAME = re.compile(r'[a-z0-9_]{1,32}')
 DECODERS = frozenset({'nvv4l2decoder', 'avdec_h264', 'avdec_h265', 'avdec_mjpeg',
                       'openh264dec', 'jpegdec'})
 
@@ -71,12 +72,21 @@ def classify_error(domain, code, message='', debug='', factory='other'):
     return {'reason': reason, 'domain': safe_domain, 'code': safe_code}
 
 
+def safe_factory(element):
+    """Plugin factory name of a message source as a fixed-charset token, else 'other'."""
+    try:
+        factory = element.get_factory() if element is not None else None
+        name = factory.get_name() if factory is not None else None
+        return name if isinstance(name, str) and FACTORY_NAME.fullmatch(name) else 'other'
+    except Exception:
+        return 'other'
+
+
 def classify_bus_error(message, warning=False):
     """GI adapter kept duck-typed for CPU regression tests."""
+    factory = safe_factory(getattr(message, 'src', None))
     try:
         error, debug = message.parse_warning() if warning else message.parse_error()
-        factory = message.src.get_factory() if message.src is not None else None
-        name = factory.get_name() if factory is not None else 'other'
-        return classify_error(error.domain, error.code, error.message, debug, name)
+        return {**classify_error(error.domain, error.code, error.message, debug, factory), 'factory': factory}
     except Exception:
-        return {'reason': 'rtsp_error', 'domain': 'unknown', 'code': None}
+        return {'reason': 'rtsp_error', 'domain': 'unknown', 'code': None, 'factory': factory}

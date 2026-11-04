@@ -49,6 +49,22 @@ class ClassifierTests(unittest.TestCase):
         message = NS(parse_warning=lambda: (error, SECRET),
                      src=NS(get_factory=lambda: NS(get_name=lambda: 'nvurisrcbin')))
         self.assertEqual(classify_bus_error(message, warning=True)['reason'], 'rtsp_auth_failed')
+        self.assertEqual(classify_bus_error(message, warning=True)['factory'], 'nvurisrcbin')
+
+    def test_bus_factory_is_a_validated_plugin_name_or_other(self):
+        error = NS(domain='gst-stream-error-quark', code=7, message=SECRET)
+        def message(name):
+            return NS(parse_error=lambda: (error, SECRET), parse_warning=lambda: (error, SECRET),
+                      src=None if name is None else NS(get_factory=lambda: NS(get_name=lambda: name)))
+        self.assertEqual(classify_bus_error(message('nvstreammux'))['factory'], 'nvstreammux')
+        self.assertEqual(classify_bus_error(message('nvv4l2decoder'))['reason'], 'decoder_error')
+        for name in (None, 'Nv Stream/Mux', SECRET, 'a' * 33, ''):
+            with self.subTest(name=name):
+                result = classify_bus_error(message(name))
+                self.assertEqual(result['factory'], 'other')
+                self.assertNotIn('192.0.2.50', json.dumps(result))
+        self.assertEqual(classify_bus_error(NS(parse_error=lambda: 1 / 0, src=None)),
+                         {'reason': 'rtsp_error', 'domain': 'unknown', 'code': None, 'factory': 'other'})
 
     def test_runtime_detail_does_not_change_backend_error_or_healthy_camera(self):
         first, second = CameraRuntime('first'), CameraRuntime('second')

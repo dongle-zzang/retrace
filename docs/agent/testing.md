@@ -6,7 +6,7 @@
 
 | 변경 영역 | 존재하는 검증 명령 |
 | --- | --- |
-| 카메라 설정/metadata/runtime/reconnect/source 재설정 정책과 제어 루프(fake Gst) | `python3 -m unittest discover -s tests -p 'test_camera_*.py'` |
+| 카메라 설정/metadata/runtime/reconnect/source 재설정·재생성 정책과 제어 루프(fake Gst), bus 경고 factory | `python3 -m unittest discover -s tests -p 'test_camera_*.py'` |
 | NvDCF OpenCV YAML 진단 파싱/traceback 비밀값 보호 | `python3 -m unittest discover -s tests -p 'test_camera_diagnostics.py'` |
 | PGIE build identity, native engine 저장 경로, 프로세스 간 경로 재사용 | `python3 -m unittest discover -s tests -p 'test_pgie_cache.py'` |
 | 첫 영상 startup timing / batch camera attribution / HTTP 저장·flush 경계 | `python3 -m unittest discover -s tests -p 'test_camera_startup_timing.py'` |
@@ -39,7 +39,7 @@
   Backend snapshot의 PostgreSQL REPEATABLE READ 선택 테스트는 session 대역을 사용하므로
   실제 PostgreSQL 격리·동시 commit 검증을 대체하지 않는다.
 
-- `tests/test_camera_shared_pipeline.py`는 실제 공유 pipeline 함수의 생성/연결을 fake Gst로 실행해 PeopleNet(primary nvinfer) 부재, 차량 nvinfer 0/1개와 연결 순서, instance 수, batch 크기, mux/demux request pad, 상태/세대 독립성 및 HTTP schema를 CPU에서 검증한다. 실제 plugin 협상/복구 보장은 아니다.
+- `tests/test_camera_shared_pipeline.py`는 실제 공유 pipeline 함수의 생성/연결을 fake Gst로 실행해 PeopleNet(primary nvinfer) 부재, 차량 nvinfer 0/1개와 연결 순서, instance 수, batch 크기, mux/demux request pad, 상태/세대 독립성 및 HTTP schema를 CPU에서 검증한다. `construct(..., reset={...})`는 가짜 bus pop마다 시계를 진행시켜 제어 루프의 제자리 재설정과 두 번째 복구의 재생성(NULL → flush-stop → unlink → release → remove → create → request → link → sync 순서, 요청 실패 후 생성부터 재시도, 끄기 옵션)을 op 로그로 검증한다. 실제 plugin 협상/복구 보장은 아니다.
 - `tests/test_pgie_cache.py`는 CPU 파일 fixture로 config 생성, 빌드 조건/후처리 분리, 별도 프로세스의 경로 안정성, 모델 staging 및 config/GObject 일치를 검증한다. 실제 TensorRT serialization은 GPU 서버에서 최초 생성 후 동일 설정으로 재실행하여 canonical engine의 deserialization 로그와 rebuild 부재를 확인해야 한다. Warm nvinfer state transition의 8–9초 지연은 별도 최적화 과제다.
 - `tests/test_preview.py`는 preview를 직접 import하므로 GI/GStreamer/PyDS와 NVIDIA plugin 환경이 필요하다. 전체 tests discovery를 일반 CPU 검증으로 간주하지 않는다.
 - Backend 테스트는 임시 SQLite DB, FastAPI TestClient, httpx MockTransport와 transaction을 사용한다. 실제 PostgreSQL/GPU/RTSP 검증을 대체하지 않는다.

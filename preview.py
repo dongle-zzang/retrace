@@ -40,7 +40,7 @@ from preview_capture import RawCapture, CaptureBusy, CaptureUnavailable, add_cap
 from preview_web import FrontendFiles, BackendAPIProxy
 from preview_socket import RealtimeHub
 from parking_relay import ParkingRelay
-from rtsp_diagnostics import classify_bus_error, source_failure_detail
+from rtsp_diagnostics import classify_bus_error, safe_factory, source_failure_detail
 
 # app.py sets its own debug default at import; retain preview's requested level.
 os.environ["GST_DEBUG"] = gst_debug
@@ -78,6 +78,10 @@ def parse_args():
     parser.add_argument(
         "--source-recovery", action=argparse.BooleanOptionalAction, default=True,
         help="Reset a source bin in place after consecutive frameless attempts; default: enabled",
+    )
+    parser.add_argument(
+        "--source-recovery-rebuild", action=argparse.BooleanOptionalAction, default=True,
+        help="From the second recovery on, replace the source bin and its mux sink pad; default: enabled",
     )
     parser.add_argument(
         "--mux-live-source", type=int, choices=(0, 1), default=1,
@@ -460,6 +464,7 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
     pipeline = None
     requested_pads = []
     source_bins = {}
+    mux_pads = {}
     bus = None
     failed = None
     pipeline_stop = threading.Event()
@@ -747,7 +752,8 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
             stop(error_code, True, source)
         elif message.type == Gst.MessageType.WARNING:
             if args.diagnostics:
-                print(f"pipeline_source={source}: GStreamer WARNING; details hidden", flush=True)
+                print(f"pipeline_source={source}: GStreamer WARNING factory={safe_factory(message.src)}; "
+                      "details hidden", flush=True)
         elif message.type == Gst.MessageType.EOS:
             # Source EOS is intercepted before the mux. Aggregate EOS is fatal.
             stop("source_eos", True, source)
@@ -779,6 +785,50 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
             # A single (or all) offline source must not terminate the shared chain.
             return Gst.PadProbeReturn.DROP
         return Gst.PadProbeReturn.OK
+
+    def demux_event(_pad, info):
+        event = info.get_event()
+        if event is not None and event.type == Gst.EventType.EOS:
+            # Releasing a mux sink pad can end that stream downstream; the JPEG branch must
+            # keep accepting buffers from the rebuilt source instead of refusing them after EOS.
+            return Gst.PadProbeReturn.DROP
+        return Gst.PadProbeReturn.OK
+
+    class SourceAttachError(RuntimeError):
+        def __init__(self, stage):
+            super().__init__(f"Could not attach source at stage {stage}")
+            self.stage = stage
+
+    def attach_source(index):
+        """Create source-bin-{index}, add it to the pipeline and link it to a fresh mux sink_{index}.
+
+        Startup and rebuild share this path so the probes, pad bookkeeping and link order
+        stay identical. Raises SourceAttachError(stage) for stage request/link; element
+        creation errors propagate unchanged so the startup log keeps their type.
+        """
+        if startup is not None:
+            startup.mark("source_create_start", index)
+        observer_options = {"observer": source_observer(startup, index, Gst)} if startup is not None else {}
+        source_bin = create_preview_source_bin(
+            index, args.input[index], args.rtsp_latency, lambda reason, i=index: source_failed(reason, i),
+            args.rtsp_drop_on_latency, max(1, int(args.camera_offline_after)), **observer_options,
+        )
+        if startup is not None:
+            startup.mark("source_created", index)
+        startup_probe(source_bin.get_static_pad("src"), "first_source_output", index)
+        source_bin.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, observe_decoded, index)
+        source_bin.get_static_pad("src").add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, source_event, index)
+        add_timing_probe(source_bin.get_static_pad("src"), "decoded", index)
+        pipeline.add(source_bin)
+        source_bins[index] = source_bin
+        mux_pad = mux.request_pad_simple(f"sink_{index}")
+        if mux_pad is None:
+            raise SourceAttachError("request")
+        requested_pads.append((mux, mux_pad))
+        mux_pads[index] = mux_pad
+        startup_probe(mux_pad, "first_mux_input", index)
+        if source_bin.get_static_pad("src").link(mux_pad) != Gst.PadLinkReturn.OK:
+            raise SourceAttachError("link")
 
     def reset_source(index):
         """Reset one silent source bin in place (deepstream-app reset_source_pipeline pattern).
@@ -812,6 +862,73 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
               "recovery_count": manager.runtimes[camera.source_id].snapshot().recovery_count},
               separators=(",", ":")), flush=True)
 
+    def detach_source(index):
+        """Drop whatever of source-bin-{index} and mux sink_{index} is attached; the slot stays empty."""
+        source_bin, mux_pad = source_bins.get(index), mux_pads.get(index)
+        if mux_pad is not None:
+            # runtime_source_add_delete order: leave flushing, unlink, release the request pad.
+            mux_pad.send_event(Gst.Event.new_flush_stop(False))
+            if source_bin is not None:
+                source_bin.get_static_pad("src").unlink(mux_pad)
+            mux.release_request_pad(mux_pad)
+            requested_pads.remove((mux, mux_pad))
+        if source_bin is not None:
+            pipeline.remove(source_bin)
+        source_bins[index] = mux_pads[index] = None
+
+    def rebuild_source(index):
+        """Replace one source bin and its mux sink pad (NVIDIA runtime_source_add_delete pattern).
+
+        Used from the second recovery on, when the in-place reset left the camera silent: a
+        fresh sink pad negotiates from scratch. The slot, source_id and demux branch stay.
+        """
+        camera = cameras_by_source[index]
+
+        def failed(stage):
+            manager.recovery_failed(index)
+            print("source_rebuild_failed " + json.dumps({"camera_id": camera.camera_id, "source_id": camera.source_id,
+                  "stage": stage}, separators=(",", ":")), flush=True)
+
+        source_bin = source_bins.get(index)
+        if source_bin is not None:  # an earlier rebuild may have left the slot empty; then just create
+            result = source_bin.set_state(Gst.State.NULL)
+            if result == Gst.StateChangeReturn.ASYNC:
+                result, current, _pending = source_bin.get_state(5 * Gst.SECOND)
+                if current != Gst.State.NULL:
+                    result = Gst.StateChangeReturn.FAILURE
+            if result == Gst.StateChangeReturn.FAILURE:
+                failed("null")  # the bin stays attached; the next recovery tries again
+                return
+            detach_source(index)
+        try:
+            attach_source(index)
+        except SourceAttachError as error:
+            detach_source(index)
+            failed(error.stage)
+            return
+        except Exception:
+            detach_source(index)
+            failed("create")
+            return
+        if not source_bins[index].sync_state_with_parent():
+            source_bins[index].set_state(Gst.State.NULL)
+            detach_source(index)
+            failed("sync")
+            return
+        generation = manager.recovered(index)
+        print("source_rebuild " + json.dumps({"camera_id": camera.camera_id, "source_id": camera.source_id,
+              "generation": generation,
+              "recovery_count": manager.runtimes[camera.source_id].snapshot().recovery_count},
+              separators=(",", ":")), flush=True)
+
+    def recover_source(index):
+        """One recovery per tick: reset in place first, rebuild from the second recovery on."""
+        if source_bins.get(index) is None or (rebuild_enabled and manager.recovery_mode(index) == "rebuild"):
+            rebuild_source(index)
+        else:
+            reset_source(index)
+
+    rebuild_enabled = getattr(args, "source_recovery_rebuild", True)
     try:
         pipeline = Gst.Pipeline.new("preview-detection")
         if pipeline is None:
@@ -882,30 +999,9 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
         startup_probe(tracker.get_static_pad("src"), "first_tracker_output", batched=True)
         tracker.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, on_batch)
 
-        for index, uri in enumerate(args.input):
+        for index in range(len(args.input)):
             setup_stage = f"source-{index}"
-            if startup is not None:
-                startup.mark("source_create_start", index)
-            observer_options = {"observer": source_observer(startup, index, Gst)} if startup is not None else {}
-            source_bin = create_preview_source_bin(
-                index, uri, args.rtsp_latency, lambda reason, i=index: source_failed(reason, i),
-                args.rtsp_drop_on_latency, max(1, int(args.camera_offline_after)), **observer_options,
-            )
-            if startup is not None:
-                startup.mark("source_created", index)
-            startup_probe(source_bin.get_static_pad("src"), "first_source_output", index)
-            source_bin.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, observe_decoded, index)
-            source_bin.get_static_pad("src").add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, source_event, index)
-            add_timing_probe(source_bin.get_static_pad("src"), "decoded", index)
-            pipeline.add(source_bin)
-            source_bins[index] = source_bin
-            mux_pad = mux.request_pad_simple(f"sink_{index}")
-            if mux_pad is None:
-                raise RuntimeError(f"Could not request nvstreammux sink_{index}")
-            requested_pads.append((mux, mux_pad))
-            startup_probe(mux_pad, "first_mux_input", index)
-            if source_bin.get_static_pad("src").link(mux_pad) != Gst.PadLinkReturn.OK:
-                raise RuntimeError(f"Could not link source bin directly to mux sink_{index}")
+            attach_source(index)
 
             setup_stage = f"jpeg-branch-{index}"
             output_bin = build_output(
@@ -926,6 +1022,7 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
             if demux_pad is None:
                 raise RuntimeError(f"Could not request nvstreamdemux src_{index}")
             requested_pads.append((demux, demux_pad))
+            demux_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, demux_event)
             startup_probe(demux_pad, "first_demux_output", index)
             add_timing_probe(demux_pad, "demux", index)
             if demux_pad.link(output_bin.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
@@ -968,7 +1065,7 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
                     on_message(bus, message)
                 due = manager.tick()
                 if due and not shutdown.is_set() and not pipeline_stop.is_set():
-                    reset_source(due[0])  # one bin per tick; the rest stay offline until later ticks
+                    recover_source(due[0])  # one bin per tick; the rest stay offline until later ticks
                 if deployment is not None:
                     try:
                         deployment.tick()
