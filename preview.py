@@ -922,11 +922,22 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
               separators=(",", ":")), flush=True)
 
     def recover_source(index):
-        """One recovery per tick: reset in place first, rebuild from the second recovery on."""
+        """One recovery per tick: reset in place first, rebuild from the second recovery on.
+
+        A plugin exception inside a recovery must not take the shared pipeline down with it:
+        the slot is deferred like a failed recovery and the control loop goes on.
+        """
         if source_bins.get(index) is None or (rebuild_enabled and manager.recovery_mode(index) == "rebuild"):
-            rebuild_source(index)
+            mode = "rebuild"
         else:
-            reset_source(index)
+            mode = "reset"
+        try:
+            (rebuild_source if mode == "rebuild" else reset_source)(index)
+        except Exception:
+            manager.recovery_failed(index)
+            camera = cameras_by_source[index]
+            print("source_recovery_error " + json.dumps({"camera_id": camera.camera_id, "source_id": camera.source_id,
+                  "mode": mode}, separators=(",", ":")), flush=True)
 
     rebuild_enabled = getattr(args, "source_recovery_rebuild", True)
     try:

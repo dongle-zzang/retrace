@@ -401,6 +401,21 @@ class SharedTests(unittest.TestCase):
                       run['captured'].splitlines())
         self.assertEqual(run['released'].count(('stream-muxer', 'sink_0')), 1)
 
+    def test_control_loop_survives_an_exception_inside_a_rebuild(self):
+        run = self.construct(2, reset={'slot': 0, 'ticks': 30, 'step': 5, 'raise_release': True})
+        self.assertEqual(run['pops'], 30)  # the loop kept polling after the failed rebuild
+        self.assertEqual(self.rebuild_ops(run)[2:], [
+            ('set_state', 'source-bin-0', 'NULL'), ('event', 'stream-muxer', 'sink_0', ('flush_stop', False)),
+            ('unlink', 'source-bin-0', 'stream-muxer', 'sink_0'), ('release', 'stream-muxer', 'sink_0')])
+        lines = run['captured'].splitlines()
+        self.assertIn('source_recovery_error {"camera_id":"camera_0","source_id":0,"mode":"rebuild"}', lines)
+        self.assertFalse(any(l.startswith('source_rebuild') for l in lines))
+        self.assertNotIn('private', run['captured'])
+        status = run['manager'].runtimes[0].snapshot()
+        self.assertEqual((status.last_error, status.recovery_count), ('pipeline_error', 1))
+        self.assertEqual(run['elements']['preview-detection'].states, ['PLAYING', 'NULL'])
+        self.assertEqual(run['elements']['source-bin-1'].states, [])
+
     def test_control_loop_keeps_resetting_in_place_when_rebuild_is_disabled(self):
         run = self.construct(2, reset={'slot': 0, 'ticks': 30, 'step': 5}, rebuild_enabled=False)
         self.assertEqual(self.rebuild_ops(run), [('set_state', 'source-bin-0', 'NULL'), ('sync', 'source-bin-0')] * 2)
@@ -465,8 +480,11 @@ class SharedTests(unittest.TestCase):
                     return None
                 return Pad(self.name, name)
             def release_request_pad(self, pad):
-                released.append((self.name, pad.name))
                 ops.append(('release', self.name, pad.name))
+                if reset is not None and reset.get('raise_release') and not any(op[0] == 'raised' for op in ops):
+                    ops.append(('raised', self.name, pad.name))  # once: shutdown releases still work
+                    raise RuntimeError('private plugin failure text')
+                released.append((self.name, pad.name))
             def add(self, element):
                 ops.append(('add', self.name, element.name))
             def remove(self, element):

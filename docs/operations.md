@@ -234,6 +234,8 @@ flush-stop → unlink → `release_request_pad` → pipeline에서 제거 → �
 `source_rebuild {camera_id, source_id, generation, recovery_count}`, 실패 시 `source_rebuild_failed {camera_id,
 source_id, stage}`(stage는 null/create/request/link/sync)를 출력합니다. NULL 단계 실패는 bin을 그대로 두고, 그 뒤
 단계의 실패는 slot을 비워 두었다가 다음 간격에 생성부터 다시 시도합니다(그동안 그 카메라만 offline).
+재설정·재생성 도중 plugin 호출이 예외를 내면 `source_recovery_error {camera_id, source_id, mode}`(mode는
+reset/rebuild, 원문 없음)를 남기고 실패한 복구와 같이 다음 간격으로 미루며 제어 루프와 다른 카메라는 계속됩니다.
 `recovery_count`는 재설정과 재생성을 함께 셉니다. mux pad 제거가 하류로 보낼 수 있는 EOS가 JPEG branch를 영구
 정지시키지 않도록 demux `src_N`에서 EOS만 DROP합니다. `--no-source-recovery-rebuild`로 끄면 두 번째 복구부터도
 제자리 재설정만 반복합니다(`--no-source-recovery`면 둘 다 꺼짐). diagnostics 모드의
