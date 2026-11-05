@@ -272,6 +272,25 @@ class RecoveryPolicyTests(unittest.TestCase):
         self.runtime.recovery_failed()  # a failed reset also counts: do not repeat it
         self.assertEqual(self.runtime.recovery_mode(), 'rebuild')
 
+    def test_recovery_mode_keeps_resetting_until_the_first_frame_ever(self):
+        self.runtime.begin_attempt()
+        self.now += 30
+        self.assertEqual(self.runtime.check_health(), 'no_frames')
+        self.frameless_attempt(1)
+        self.assertEqual(self.runtime.recovery_mode(), 'reset')
+        self.runtime.begin_recovery()
+        self.now += 30
+        self.assertEqual(self.runtime.check_health(), 'no_frames')
+        self.assertEqual(self.runtime.recovery_mode(), 'reset')  # second recovery, still no frame since start
+        self.now += self.runtime.retry_delay()
+        self.runtime.begin_attempt()
+        self.frames()  # 3 s: too short to clear the recovery count
+        self.now += 10
+        self.assertEqual(self.runtime.check_health(), 'no_frames')
+        self.frameless_attempt(1)
+        self.frameless_attempt(2)
+        self.assertEqual(self.runtime.recovery_mode(), 'rebuild')
+
     def test_status_serializes_recovery_count_without_secrets(self):
         generation = self.runtime.begin_attempt()
         self.runtime.fail('rtsp://private-secret@camera.example/video', generation)

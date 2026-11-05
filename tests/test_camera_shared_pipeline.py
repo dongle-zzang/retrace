@@ -203,20 +203,35 @@ class SharedTests(unittest.TestCase):
         self.assertEqual(callback(appsink), 'OK')
         self.assertEqual(failures, ['JPEG output failed; details hidden'])
 
-    def silence(self, manager, slot):
+    def silence(self, manager, slot, decoded_first=False):
         """Two frameless attempts for one slot (no_frames at 30 s and 61 s) while the other decodes.
 
         Stops at 62 s: the second backoff (2 s) has not elapsed, so no tick has acted on the
         due slot yet; the caller advances past 63 s.
+
+        decoded_first: the slot decodes for 1 s first (no_frames at 11 s, then at 42 s and 74 s);
+        stops at 74.5 s, before the third backoff (5 s) ends. Rebuild needs a frame since start.
         """
         other = 1 - slot
-        for _ in range(620):
+
+        def decode(decoding):
             self.now = round(self.now + .1, 1)
-            manager.observe_decoded(other, int(self.now * 1000))
+            pts = int(self.now * 1000)
+            for s in decoding:
+                manager.observe_decoded(s, pts)
+                if decoded_first:  # keep output flowing so the long timeline stays online
+                    manager.publish(s, pts, lambda: None, output=True)
             manager.tick()
+
+        if decoded_first:
+            for _ in range(10):
+                decode((slot, other))
+        for _ in range(735 if decoded_first else 620):
+            decode((other,))
         self.assertEqual(manager.runtimes[other].snapshot().state, 'online')
         status = manager.runtimes[slot].snapshot()
-        self.assertEqual((status.state, status.last_error, status.generation), ('offline', 'no_frames', 2))
+        self.assertEqual((status.state, status.last_error, status.generation),
+                         ('offline', 'no_frames', 3 if decoded_first else 2))
 
     def test_tick_returns_only_due_slots_and_leaves_them_offline(self):
         manager = self.manager()
@@ -233,7 +248,7 @@ class SharedTests(unittest.TestCase):
 
     def test_manager_recovery_mode_follows_each_slot(self):
         manager = self.manager()
-        self.silence(manager, 0)
+        self.silence(manager, 0, decoded_first=True)
         self.now += 5
         self.assertEqual([manager.recovery_mode(slot) for slot in (0, 1)], ['reset', 'reset'])
         self.assertEqual(manager.tick(), [0])
@@ -344,7 +359,7 @@ class SharedTests(unittest.TestCase):
 
     def test_control_loop_rebuilds_the_source_on_its_second_recovery(self):
         # 5 s per tick: reset at the first due tick, no_frames 30 s later, rebuild once 120 s have passed.
-        run = self.construct(2, reset={'slot': 0, 'ticks': 30, 'step': 5})
+        run = self.construct(2, reset={'slot': 0, 'ticks': 36, 'step': 5, 'decoded_first': True})
         bins = [e for e in run['all_elements'] if e.name == 'source-bin-0']
         self.assertEqual(len(bins), 2)  # startup bin, rebuilt bin
         old, new = bins
@@ -375,7 +390,7 @@ class SharedTests(unittest.TestCase):
 
     def test_control_loop_retries_rebuild_from_creation_after_a_request_failure(self):
         # The second sink_0 request (first rebuild) fails; the next rebuild 600 s later starts at creation.
-        run = self.construct(2, reset={'slot': 0, 'ticks': 170, 'step': 5, 'fail_request': ('sink_0', 2)})
+        run = self.construct(2, reset={'slot': 0, 'ticks': 170, 'step': 5, 'decoded_first': True, 'fail_request': ('sink_0', 2)})
         ops = self.rebuild_ops(run, start=2)
         self.assertEqual(ops[:9], [
             ('set_state', 'source-bin-0', 'NULL'), ('event', 'stream-muxer', 'sink_0', ('flush_stop', False)),
@@ -393,7 +408,7 @@ class SharedTests(unittest.TestCase):
         self.assertEqual(run['manager'].runtimes[0].snapshot().recovery_count, 2)  # one reset, one rebuild
 
     def test_control_loop_gives_up_a_rebuild_whose_bin_never_reaches_null(self):
-        run = self.construct(2, reset={'slot': 0, 'ticks': 30, 'step': 5, 'result': 'ASYNC',
+        run = self.construct(2, reset={'slot': 0, 'ticks': 36, 'step': 5, 'decoded_first': True, 'result': 'ASYNC',
                                        'get_state': ('ASYNC', 'READY', 'NULL')})
         self.assertEqual(self.rebuild_ops(run)[2:], [('set_state', 'source-bin-0', 'NULL'),
                                                      ('get_state', 'source-bin-0', 5000)])
@@ -402,8 +417,8 @@ class SharedTests(unittest.TestCase):
         self.assertEqual(run['released'].count(('stream-muxer', 'sink_0')), 1)
 
     def test_control_loop_survives_an_exception_inside_a_rebuild(self):
-        run = self.construct(2, reset={'slot': 0, 'ticks': 30, 'step': 5, 'raise_release': True})
-        self.assertEqual(run['pops'], 30)  # the loop kept polling after the failed rebuild
+        run = self.construct(2, reset={'slot': 0, 'ticks': 36, 'step': 5, 'decoded_first': True, 'raise_release': True})
+        self.assertEqual(run['pops'], 36)  # the loop kept polling after the failed rebuild
         self.assertEqual(self.rebuild_ops(run)[2:], [
             ('set_state', 'source-bin-0', 'NULL'), ('event', 'stream-muxer', 'sink_0', ('flush_stop', False)),
             ('unlink', 'source-bin-0', 'stream-muxer', 'sink_0'), ('release', 'stream-muxer', 'sink_0')])
@@ -417,7 +432,7 @@ class SharedTests(unittest.TestCase):
         self.assertEqual(run['elements']['source-bin-1'].states, [])
 
     def test_control_loop_keeps_resetting_in_place_when_rebuild_is_disabled(self):
-        run = self.construct(2, reset={'slot': 0, 'ticks': 30, 'step': 5}, rebuild_enabled=False)
+        run = self.construct(2, reset={'slot': 0, 'ticks': 36, 'step': 5, 'decoded_first': True}, rebuild_enabled=False)
         self.assertEqual(self.rebuild_ops(run), [('set_state', 'source-bin-0', 'NULL'), ('sync', 'source-bin-0')] * 2)
         self.assertEqual(run['manager'].recovery_mode(0), 'rebuild')
         self.assertEqual(sum(l.startswith('source_reset ') for l in run['captured'].splitlines()), 2)
@@ -433,7 +448,7 @@ class SharedTests(unittest.TestCase):
         if reset is None:
             shutdown.set()
         else:
-            self.silence(manager, reset['slot'])
+            self.silence(manager, reset['slot'], decoded_first=reset.get('decoded_first', False))
             self.now += 5
             other = 1 - reset['slot']
 

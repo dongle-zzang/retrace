@@ -211,7 +211,8 @@ class CameraRuntime:
     def recovery_mode(self):
         """'reset' for the first recovery since the last stable period, 'rebuild' afterwards."""
         with self._lock:
-            return 'reset' if self._recoveries == 0 else 'rebuild'
+            # shortcut: 첫 caps부터 거부된 스트림은 재생성하지 않음, 재시작 후에도 안 뜨는 카메라가 계속 멈춰 있으면 재검토
+            return 'reset' if self._recoveries == 0 or self._ever_frame is None else 'rebuild'
 
     def _defer_recovery(self):
         self._recoveries += 1

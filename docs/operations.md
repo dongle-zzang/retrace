@@ -230,7 +230,9 @@ nvurisrcbin이 RTSP 연결과 디코더를 다시 만듭니다. ghost pad target
 `runtime_source_add_delete` 샘플 순서): `source-bin-N`을 NULL(ASYNC면 최대 5초 대기) → mux `sink_N`에
 flush-stop → unlink → `release_request_pad` → pipeline에서 제거 → 같은 이름의 bin을 새로 만들어 프로브를 다시
 붙이고 `sink_N`을 다시 요청해 연결 → 부모와 동기화. not-negotiated를 겪은 mux sink pad의 협상 상태가 재설정만으로는
-풀리지 않는 경우(2026-11-04 운영 결과)를 위한 것이며 slot/source_id/demux `src_N`/JPEG branch는 유지됩니다. 성공 시
+풀리지 않는 경우(2026-11-04 운영 결과)를 위한 것이며 slot/source_id/demux `src_N`/JPEG branch는 유지됩니다.
+프로세스 시작 후 프레임을 한 번도 받지 못한 카메라는 mux pad에 풀 협상 상태가 없으므로 몇 번째 복구든 재설정만
+합니다(도달 불가 카메라가 10분마다 nvurisrcbin을 만들었다 지우지 않도록). 성공 시
 `source_rebuild {camera_id, source_id, generation, recovery_count}`, 실패 시 `source_rebuild_failed {camera_id,
 source_id, stage}`(stage는 null/create/request/link/sync)를 출력합니다. NULL 단계 실패는 bin을 그대로 두고, 그 뒤
 단계의 실패는 slot을 비워 두었다가 다음 간격에 생성부터 다시 시도합니다(그동안 그 카메라만 offline).
