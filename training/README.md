@@ -214,6 +214,9 @@ TensorRT 8.6은 opset 17과 Volta를 지원한다. 다만 Docker 권한이 없�
 5. 적용 후: 로그의 engine build/deserialize, `/api/cameras/<camera>/vehicles`, 주차 점유, 전체 카메라 FPS/VRAM,
    PeopleNet 사람 검출 회귀를 적용 전과 비교한다. 기존 P1 미검출 원인(비-antialias GPU 축소)은
    모델 교체로 해결되지 않을 수 있으므로 같은 장면에서 따로 확인한다.
+6. 차량 윤곽선 seg를 쓰는 경우: 새 det를 운영에 올린 뒤 `graft_seg.py`로 그 best.pt를 YOLO11m-seg에 다시 이식하고
+   DeepStream-Yolo-Seg로 export한다(80클래스 vehicle3 모델만 가능). 명령은 [운영 문서](../docs/operations.md#차량-윤곽선seg-선택)
+   G1–G3이다. 테스트: `.venv/bin/python -m unittest discover -s tests -p 'test_graft_seg.py'`(torch만 필요).
 
 ## 검증
 

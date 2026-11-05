@@ -81,6 +81,7 @@ DB statement/lock/connect timeout과 parameter masking을 적용한다.
 | GET /api/cameras/{camera_id} | 공개 카메라 상세; 알 수 없는 ID 404 |
 | GET /api/cameras/{camera_id}/status | 최신 runtime 상태 및 observed_at/stale |
 | GET /api/cameras/{camera_id}/tracks?limit=100 | current bbox와 recent DB 요약; limit 1~500 |
+| GET /api/cameras/{camera_id}/vehicles | 최신 차량 pixel bbox, 문자열 track ID, 선택적 `outline`, detector 가용성 |
 | GET /api/status | 전체 카메라 상태 목록과 state별 counts |
 | POST /api/cameras/{camera_id}/parking-spaces | 주차면 생성, 201 |
 | GET /api/cameras/{camera_id}/parking-spaces | 카메라별 목록, 생성 시각/ID 순 |
@@ -90,6 +91,29 @@ DB statement/lock/connect timeout과 parameter masking을 적용한다.
 | GET /api/cameras/{camera_id}/parking-summary | total / occupied / empty / unknown 개수 |
 
 Pydantic 응답 schema는 `app/schemas.py`, OpenAPI는 `/openapi.json`에 있다.
+
+### 차량 윤곽(outline)
+
+`/api/cameras/{camera_id}/vehicles`의 차량마다 `outline`이 있다(2026-11-05 추가, 다른 필드와 의미는 그대로).
+
+- 값: `[[x, y], ...]` 또는 `null`. 좌표계는 같은 차량의 `bbox`와 같은 mux pixel(`bbox_width × bbox_height`, 지금
+  1920×1080)이고 원점은 왼쪽 위, y는 아래로 증가한다. 0~1 정규화는 `bbox_width`/`bbox_height`로 나눈다.
+- 닫힌 다각형: 마지막 점이 첫 점으로 이어지며 첫 점을 반복하지 않는다. 화면 기준 시계 방향, 3–32점, 소수 첫째 자리.
+- 윤곽은 tracker 박스 위에 늘인 것이라 항상 `bbox` 안에 있다.
+- `null`: seg를 끔(`VEHICLE_SEG_INFER_CONFIG` 비어 있음), seg가 그 차량을 찾지 못함, mask가 박스의 15% 미만, 계산
+  오류, preview가 보낸 값이 형식에 맞지 않음. 형식 오류는 그 차량만 null이 되고 frame과 다른 차량은 그대로다
+  (poller가 frame 하나의 검증 실패로 모든 카메라 frame을 버리기 때문). 프론트는 null이면 bbox 판정으로 대체한다.
+
+알려진 한계(주차면 판정에 쓸 때):
+
+- 윤곽은 mask에서 만든 다각형 하나이며, mask가 있는 행마다 가장 왼쪽과 가장 오른쪽 경계를 잇는다(최대 16행).
+  같은 행에서 mask가 여러 조각이면 그 사이를 메운다. 그래서 기둥·다른 차·사람에 가려 mask가 끊긴 차량은 윤곽이
+  가린 물체를 가로질러 그 영역까지 포함한다.
+- 윤곽 하단(접지부): 바퀴 사이의 빈 곳은 메워져 차량 바닥 면적으로 보인다. 차량 아래쪽이 앞 물체에 가려지면 하단은
+  가린 물체를 포함하거나, mask가 끝난 곳에서 끝나 실제 접지선보다 위에 있을 수 있다. 가려진 부분은 추정하지 않는다.
+- seg 박스와 det 박스가 다르면 윤곽이 그만큼 늘거나 줄어든다(정차 차량은 차이가 작다). 행 사이의 오목한 모양은
+  직선으로 이어진다.
+
 Browser 영상 요청은 기존 retrace:40225로 직접 보낸다. Backend의 preview_path는
 preview origin 기준 상대 경로다. `metadata_path`(`/ws`)는 여러 카메라 JPEG와 metadata를
 WebSocket 하나로 받는 경로다. Backend는 영상을 relay하지 않는다. binary 형식은

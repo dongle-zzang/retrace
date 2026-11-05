@@ -284,7 +284,7 @@ Perspective 보정·차량 segmentation·깊이 추정은 아니다. 가림/카�
 
 | GET API | 역할 |
 | --- | --- |
-| `/api/cameras/{camera_id}/vehicles` | 최신 차량 pixel bbox, 문자열 track ID, detector 가용성 |
+| `/api/cameras/{camera_id}/vehicles` | 최신 차량 pixel bbox, 문자열 track ID, 선택적 `outline`([계약](../backend/README.md#차량-윤곽outline)), detector 가용성 |
 | `/api/cameras/{camera_id}/parking-spaces` | Polygon과 현재 상태; stale 관찰은 unknown으로 응답 |
 | `/api/cameras/{camera_id}/parking-summary` | 현재 total / occupied / empty / unknown |
 | `/api/cameras/{camera_id}/parking-assessments` | revision에 맞는 최신 판정 reason, 후보 점수(최대 20개), footprint, 지속 시간, 실제 policy |

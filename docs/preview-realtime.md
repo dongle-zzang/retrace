@@ -6,7 +6,7 @@
 tracker probe는 PyDS 값을 복사하고 네트워크/DB I/O는 하지 않는다. 영상은 카메라별 OSD/JPEG branch 하나뿐이다.
 
 ```text
-RTSP → nvurisrcbin(NVMM) → nvstreammux → 차량 nvinfer(주차장 카메라 ROI만) → NvDCF
+RTSP → nvurisrcbin(NVMM) → nvstreammux → 차량 nvinfer(주차장 카메라 ROI만) → [seg nvinfer, 선택] → NvDCF
   ├─ tracker probe → MetadataStore → /ws JSON, /metadata.json
   └─ nvstreamdemux → 카메라별 queue(leaky) → nvdsosd → nvjpegenc(1280×720) → appsink
       → FrameStore(카메라당 최신 JPEG 1장)
@@ -14,7 +14,9 @@ RTSP → nvurisrcbin(NVMM) → nvstreammux → 차량 nvinfer(주차장 카메�
           └─ /ws            : 구독한 모든 카메라 JPEG를 binary message로, 연결 1개
 ```
 
-JPEG에는 서버 OSD(주차장 카메라의 차량 bbox와 `Vehicle` 라벨만)가 그려져 있다. 차량 track ID는 metadata에만 있다. 같은 정보가 `/ws` detections로도 오므로
+JPEG에는 서버 OSD(주차장 카메라의 차량 bbox와 `Vehicle` 라벨만)가 그려져 있다. seg(`VEHICLE_SEG_INFER_CONFIG`)를 켜면
+주차장 카메라 차량에 윤곽선이 그려지고, 윤곽이 붙은 차량의 박스는 `VEHICLE_OUTLINE_BOX_WIDTH`(기본 1, 0이면 숨김)로
+얇아진다. 윤곽이 없는 차량은 기존 굵은 박스다([운영](operations.md#차량-윤곽선seg-선택)). 차량 track ID는 metadata에만 있다. 같은 정보가 `/ws` detections로도 오므로
 제품 화면은 JPEG만 표시하거나 별도 overlay를 그릴 수 있다.
 
 브라우저는 HTTP/1.1에서 origin당 동시 연결을 6개로 제한한다. `/mjpeg/sourceN`은 응답을 계속 열어 두므로
@@ -121,6 +123,8 @@ Re-ID/line/zone 계산은 구현하지 않았다. 다른 producer는
 1초 이상 막히면 connection을 종료한다. 주차 transition만 Backend DB에 기본 7일 저장하며 다른 event의 durable 저장은 별도 정책이 필요하다.
 
 `/metadata.json`의 pixel bbox/snake_case 계약은 유지한다. `persons`는 항상 빈 배열이며 `inference_done`은 차량 추론 여부다.
+차량마다 `outline`(`[[x, y], ...]` pixel 다각형 또는 null)이 있으며 의미와 한계는
+[backend README의 차량 윤곽](../backend/README.md#차량-윤곽outline)이 원문이다. `/ws` detections에는 윤곽을 넣지 않는다.
 `/streams.json` 항목은 `format=mjpeg`, `url=/mjpeg/sourceN`, `metadata_path=/ws`를 제공한다.
 Backend `/api/cameras`의 `preview_path`는 `/mjpeg/sourceN`, `metadata_path`는 `/ws`다.
 

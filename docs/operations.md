@@ -157,6 +157,102 @@ native precision fallback이 발생하면 같은 build key 안의 FP16/FP32 engi
 새 정책의 첫 실행은 engine 생성 시간이 필요할 수 있고, 이후 동일 조건에서 재사용합니다.
 GPU/TensorRT 환경이 다른 장비의 engine을 그대로 복사하지 않습니다.
 
+### 차량 윤곽선(seg, 선택)
+
+주차장 카메라 영상에 차량 윤곽선을 그리고 `/api/cameras/{id}/vehicles`에 `outline`을 싣는 두 번째 nvinfer입니다.
+운영 det 가중치를 YOLO11m-seg에 이식한 모델을 같은 ROI에서 돌립니다. 설계·근거는
+[설계 문서](superpowers/specs/2026-11-05-vehicle-outline-segmentation-design.md), API 계약은
+[backend README의 차량 윤곽](../backend/README.md#차량-윤곽outline)입니다.
+
+| 환경 변수 | 기본 | 역할 |
+| --- | --- | --- |
+| `VEHICLE_SEG_INFER_CONFIG` | 빈 값(끔) | seg nvinfer config. 비우면 seg element가 없고 pipeline·OSD는 이전과 같다(JSON의 `outline`은 null) |
+| `VEHICLE_OUTLINE_BOX_WIDTH` | 1 | 윤곽이 붙은 차량의 박스 두께 0–3. 0은 박스를 숨기고 `Vehicle` 글자만 남긴다. 그 밖의 값은 1 |
+
+seg 준비가 실패하면 `Vehicle segmentation unavailable; details hidden; outlines disabled`를 남기고 seg 없이
+시작합니다(차량 검출은 그대로). 시작 로그 `vehicle_segmentation graft=match|stale|unknown`은 이식에 쓴 det
+가중치가 OTA 활성 det와 같은지 보여 줍니다. `stale`이면 `WARNING`이 붙고, 아래 G1과 G3을 새 best.pt로 다시 한 뒤
+재시작합니다(자동 재이식은 없음). 같은 값이 `--diagnostics` 5초 `vehicle_masks` 줄과 OTA가 켜져 있을 때
+`GET /api/training/deployment`의 `segmentation_graft`에도 나옵니다.
+
+`models/yolo11m-seg/`(gitignore)에 둡니다: DeepStream-Yolo-Seg clone(commit `a8ec7ec`, MIT, 저장소 patch 적용),
+`graft.pt`·`manifest.json`(이식), `graft.onnx`·`labels.txt`(export), `vehicle_seg_infer.txt`.
+
+G1. 호스트에서 모델 준비(운영 영향 없음, CPU로 실행):
+
+```bash
+mkdir -p models/yolo11m-seg && cd models/yolo11m-seg
+git clone https://github.com/marcoslucianops/DeepStream-Yolo-Seg.git
+git -C DeepStream-Yolo-Seg checkout a8ec7eccd1e57829c95f9ed1283176787df7f09f
+git -C DeepStream-Yolo-Seg apply ../../../tools/deepstream-yolo-seg-a8ec7ec.patch
+git -C DeepStream-Yolo-Seg diff --stat        # 파서 1개, export 1개 파일
+PY=../../training/.venv/bin/python
+CUDA_VISIBLE_DEVICES= $PY -c "from ultralytics.utils.downloads import attempt_download_asset as d; d('yolo11m-seg.pt')"
+python3 -c "import json; print(json.load(open('../../.cache/vehicle-deployments/committed.json'))['active']['config'])"
+# 위 출력의 디렉터리에 있는 best.pt(활성 det)를 이식한다
+CUDA_VISIBLE_DEVICES= $PY ../../training/graft_seg.py --seg yolo11m-seg.pt --det ../../.cache/vehicle-deployments/<활성 operation>/best.pt --out-dir .
+CUDA_VISIBLE_DEVICES= $PY DeepStream-Yolo-Seg/utils/export_yolo11_seg.py -w graft.pt --dynamic --simplify --conf-threshold 0.1
+cd ../..
+```
+
+`graft_seg.py`가 출력한 `det_weights_sha256`은 활성 배포 디렉터리 `manifest.json`의 `weights_sha256`과 같아야 합니다.
+config `models/yolo11m-seg/vehicle_seg_infer.txt`(경로는 이 파일 기준 상대 경로):
+
+```ini
+[property]
+onnx-file=graft.onnx
+labelfile-path=labels.txt
+custom-lib-path=DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/libnvdsinfer_custom_impl_Yolo_seg.so
+parse-bbox-instance-mask-func-name=NvDsInferParseYoloSeg
+net-scale-factor=0.0039215697906911373
+model-color-format=0
+maintain-aspect-ratio=1
+symmetric-padding=1
+scaling-filter=1
+num-detected-classes=80
+network-type=3
+cluster-mode=4
+output-instance-mask=1
+segmentation-threshold=0.5
+network-mode=2
+
+[class-attrs-all]
+pre-cluster-threshold=0.1
+```
+
+`engine-create-func-name`은 넣지 않습니다(위 engine cache 정책). runtime이 batch, ROI, gie id, class filter를
+덮어씁니다.
+
+G2. 파서 빌드(컨테이너): `sudo docker compose exec -T retrace bash -lc 'cd models/yolo11m-seg/DeepStream-Yolo-Seg && CUDA_VER=12.2 make -C nvdsinfer_custom_impl_Yolo_seg'`
+
+G3. engine 미리 빌드(별도 프로세스, 실행 중 pipeline은 그대로, 빌드 동안 GPU를 씀):
+
+```bash
+sudo docker compose exec -T -e VEHICLE_SEG_INFER_CONFIG=models/yolo11m-seg/vehicle_seg_infer.txt retrace python3 tools/build_vehicle_seg_engine.py
+```
+
+`vehicle_segmentation graft=...`와 `Engine ready: .cache/vehicle-seg/pgie/...`가 나와야 합니다.
+
+G4. seg 끔 상태로 30분 기준선을 잽니다(아래 측정). G5. `.env`에 `VEHICLE_SEG_INFER_CONFIG=models/yolo11m-seg/vehicle_seg_infer.txt`를
+넣고 `sudo docker compose up -d --force-recreate retrace`(env_file 변경은 재생성해야 반영). 로그에 seg engine
+build 없이 deserialize가 나오고 `vehicle_segmentation graft=match`인지 봅니다.
+OTA 상태 API에 `segmentation_graft`를 보이려면 `systemctl --user restart retrace-training-worker`가 필요합니다.
+
+G6. 확인: 주차장 카메라 JPEG에 윤곽선과 얇은 박스(GPU 모드 `display-mask`와 색), 화면 가장자리 차량의 윤곽 위치,
+`curl -s http://127.0.0.1:8000/api/cameras/b1_parking_overview/vehicles`의 `outline`, `VEHICLE_OUTLINE_BOX_WIDTH=0`으로
+재생성했을 때 박스가 사라지고 글자가 같은 자리에 남는지, 24시간 RSS·VRAM 추이.
+
+측정(seg 끔/켬 각 30분, 허용 기준은 설계 §5):
+
+```bash
+sudo docker compose logs -t --since=30m retrace | grep -E ' fps=|stage=vehicle(-seg)?-batch|^.*vehicle_masks '
+sudo docker compose exec -T retrace python3 tools/measure_preview.py --seconds 600 --report .cache/measure/seg-on.json
+timeout 600 nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader -l 1   # 호스트
+top -b -d 5 -n 120 -p "$(pgrep -f 'preview.py --cameras' | tail -1)"            # 호스트
+```
+
+되돌리기: `.env`의 `VEHICLE_SEG_INFER_CONFIG`를 비우고 `sudo docker compose up -d --force-recreate retrace`.
+
 ## 미리보기와 검증
 
 기본 미리보기는 하나의 legacy nvstreammux, batch-size=enabled 카메라 수, 1920×1080 mux,

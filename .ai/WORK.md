@@ -20,6 +20,17 @@
 - Next action: 사용자 확인 후 재시작 가능한 시간에 3단계 배포. 배포 직후 `camera_status` 252줄 확인, 이후 `source_recovery_(hung|unblocked|abandoned)` 발생 시 traceback의 멈춘 줄을 3단계 설계 §1 Not verified에 기록(§6 GPU 검증). 그 뒤 2단계 관찰을 이어간다: 자연 발생 대기([11-04 설계](../docs/superpowers/specs/2026-11-04-camera-source-rebuild-design.md) §6). 3대 외 카메라에서 `source_reset` → 120초 뒤 `source_rebuild` → `NVMM video pad linked` → online이 확인되면 이 작업을 idle로 되돌리고 project-status §5의 관찰 항목을 닫는다. 그 직후 WARNING `factory=` 로그로 거부 element를 기록한다. 수일 후 메모리/`nvidia-smi` 추이 확인. 문제가 생기면 `--no-source-recovery-rebuild`로 1단계만 남긴다. 3대 원인(네트워크 도달 불가 2, 인증 거절 1)은 project-status §5에 기록했고 서버 밖 조치다.
 - Blockers: none.
 
+## 두 번째 작업: 주차장 카메라 차량 윤곽선(instance mask) (2026-11-05 시작)
+
+- Status: **구현·main 커밋(2026-11-05), 기본 끔. GPU 검증(G1–G6)과 운영 적용 대기.** [설계](../docs/superpowers/specs/2026-11-05-vehicle-outline-segmentation-design.md)(승인, 구현 메모 포함), [계획](../docs/superpowers/plans/2026-11-05-vehicle-outline-segmentation.md), 운영 절차는 `docs/operations.md` "차량 윤곽선(seg, 선택)".
+- 선택안 A′: 운영 det 가중치를 YOLO11m-seg에 이식한 seg 모델을 두 번째 nvinfer(gie 3, 같은 ROI)로 추가. `VEHICLE_SEG_INFER_CONFIG`로 켜고 끔(끄면 pipeline·OSD 동일, JSON `outline: null`만 추가). `VEHICLE_OUTLINE_BOX_WIDTH` 0–3(기본 1). det·OTA 무변경, 상태에 `segmentation_graft` 추가.
+- Changed: `vehicle_detection.py`(seg config 준비·공통 helper, mask 이식, 행 스캔 윤곽, `graft_status`), `person_metadata.py`(`outline`), `preview.py`(seg element·probe 단계·`display-mask`·`detach_vehicle`·진단 `vehicle_masks`·시작 로그), `vehicle_deployment.py`(`segmenter`, `segmentation_graft`), `backend/app/schemas.py`(관대한 `outline` 검증: 형식 오류는 그 차량만 null), `tools/build_vehicle_engine.py`(`serialize_engine` 추출), 새 `tools/build_vehicle_seg_engine.py`, `tools/deepstream-yolo-seg-a8ec7ec.patch`, `training/graft_seg.py`, tests, docs.
+- Verified (CPU, 2026-11-05): `/tmp/retrace-shared-venv` 루트 전체 217 중 오류 1(기존 GPU 전용 `test_preview.py` gi import), `test_camera_*.py` 97 OK, `test_vehicle_detection.py` 24 OK, `test_vehicle_deployment.py` 25 OK, backend pytest 168 passed, training 34 OK(skip 6). det 생성 config가 리팩터링 전 기준 텍스트와 같음. patch가 `a8ec7ec`에 적용, 패치한 파서가 DS 7.0·TensorRT·CUDA 12.2 헤더로 문법 검사 통과, 패치한 export가 training venv에서 dynamic ONNX 생성, `graft_seg.py` 출력 det sha256 = 활성 모델(`e3b72c71`) `weights_sha256`.
+- 근거 측정(CPU, 회사 test split 10장/GT 76): COCO YOLO11m-seg recall 0.487(검출 가지가 COCO YOLO11m과 텐서 649개 동일), 이식 seg 0.908(운영 박스 80/80 재현), 이식 vs COCO mask IoU 0.90. 32점 행 스캔 윤곽 IoU 0.836(cv2 approxPolyDP 0.829).
+- NOT verified (GPU, 설계 §2-1·§7-2): secondary nvinfer instance mask 실제 부착, custom TRT plugin을 native ONNX builder가 찾는지(G3), nvdsosd GPU 모드 `display-mask`와 색, 두께 0 박스가 안 그려지는지, tracker 뒤 `mask_params` 유지, 성능(§5: FPS 합계 ≥95%·카메라별 ≥90%, VRAM +1.5 GiB 이하·여유 ≥8 GiB, GPU 중앙값 ≤60%, probe ≤50 ms/s·batch ≤10 ms, 커버리지 ≥0.8), 24시간 메모리.
+- 측정 기록 자리(G4/G6 결과를 여기에): 기준선 — / seg 켬 — / `vehicle_masks` — / VRAM·GPU — .
+- Next action: 사용자가 `docs/operations.md`의 G1(호스트) → G2·G3(`sudo docker compose exec`) → G4 기준선 → G5 `.env` 설정 후 `sudo docker compose up -d --force-recreate retrace` → G6 확인·측정. 결과를 위 자리에 기록하고 G6 뒤 `VEHICLE_OUTLINE_BOX_WIDTH` 기본값을 사용자가 정한다. 문제가 있으면 `.env` 값을 비우고 재생성.
+
 ## 원인 조사 결과 (2026-11-03, 서버 96시간 로그)
 
 - 끊긴 카메라 6대 모두 장애 후 세대 주기가 60초로 bus 메시지 없이 앱 watchdog만 돌았다(source bin 침묵). 경로는 두 가지: 디코더 WARNING 후 침묵(b1_parking_gate), not-negotiated WARNING → RTSP timeout 1회 → 침묵(3f_auditorium_door, 6f_office_inner, b1_parking_overview, 6f_lobby). 상세와 배제된 가설은 설계 문서 §1.

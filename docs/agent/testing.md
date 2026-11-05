@@ -22,9 +22,9 @@
 | Backend API/polling/DB/preview 계약/보안 | `python -m pytest -q backend/tests` |
 | 주차면 CRUD/Polygon 검증/카메라 분리/재시작 보존/점유 revision | `python -m pytest -q backend/tests/test_parking.py` |
 | 점유 기하/정차·통과/누락·재연결/이벤트·재생 평가 | `python -m pytest -q backend/tests/test_occupancy.py` |
-| 주차장 카메라 선택(비활성 ID skip)/공유 batch/ROI/모델 config/차량 metadata | `python -m unittest discover -s tests -p 'test_vehicle_detection.py'` |
+| 주차장 카메라 선택(비활성 ID skip)/공유 batch/ROI/모델 config/차량 metadata, seg config 강제 값·det 생성 config 불변(기준 텍스트)·이식 출처 상태, det↔seg 짝짓기·mask 이식(fake pyds), 행 스캔 윤곽·`outline` 직렬화 | `python -m unittest discover -s tests -p 'test_vehicle_detection.py'` (numpy 필요) |
 | 상태/이벤트 cursor 경계·페이지 backlog·원자적 발행 실패·장애 unknown | `python -m unittest discover -s tests -p 'test_parking_relay.py'` |
-| 차량 모델 배포 runtime(config OTA·검증·commit·자동/수동 롤백·취소·재시작 복원, FPS 구간 중앙값 기준선·카메라 자체 변동·차량 추론 처리량·배포 전/중 오프라인 구분·롤백 후 원인 진단·추론 중단/load 타임아웃, fake nvinfer) | `python3 -m unittest discover -s tests -p 'test_vehicle_deployment.py'` (Python 3.9+) |
+| 차량 모델 배포 runtime(config OTA·검증·commit·자동/수동 롤백·취소·재시작 복원, FPS 구간 중앙값 기준선·카메라 자체 변동·차량 추론 처리량·배포 전/중 오프라인 구분·롤백 후 원인 진단·추론 중단/load 타임아웃, 상태의 `segmentation_graft`, fake nvinfer) | `python3 -m unittest discover -s tests -p 'test_vehicle_deployment.py'` (Python 3.9+) |
 | 배포 export: COCO80/1클래스 class map, YOLO11m 구조(class head만 축소 허용), ONNX class remap·I/O 계약 | `cd training && .venv/bin/python -m unittest discover -s tests -p 'test_deploy_export.py'` (onnx/numpy, Ultralytics·GPU 불필요) |
 | 학습 데이터셋 검사/coco80 view/웹 worker (training venv) | `cd training && .venv/bin/python -m unittest discover -s tests` (worker 통합 테스트는 backend 의존성이 있는 Python에서만 실행되고 없으면 skip) |
 | DeepStream HTTP/element link 포함 전체 Python 회귀 | `docker compose exec -T retrace python3 -m unittest discover -s tests -p 'test_*.py'` |
@@ -40,6 +40,7 @@
   실제 PostgreSQL 격리·동시 commit 검증을 대체하지 않는다.
 
 - `tests/test_camera_shared_pipeline.py`는 실제 공유 pipeline 함수의 생성/연결을 fake Gst로 실행해 PeopleNet(primary nvinfer) 부재, 차량 nvinfer 0/1개와 연결 순서, instance 수, batch 크기, mux/demux request pad, 상태/세대 독립성 및 HTTP schema를 CPU에서 검증한다. `construct(..., reset={...})`는 가짜 bus pop마다 시계를 진행시켜 제어 루프의 제자리 재설정과 두 번째 복구의 재생성(NULL → flush-stop → unlink → release → remove → create → request → link → sync 순서, 요청 실패 후 생성부터 재시도, 끄기 옵션)을 op 로그로 검증한다. 복구는 작업 스레드에서 돌므로 harness는 시계를 fake `time.monotonic`(test.now)으로 주입하고 pop마다 작업 스레드 완료를 기다린다. `reset={'hang': N}`은 source-bin-0의 첫 NULL을 pop N까지(None이면 끝까지) 막아 hung → kick → unblocked/abandoned와 종료 join을 검증한다. 실제 plugin 협상/복구 보장은 아니다.
+- seg 윤곽선: `tests/test_camera_shared_pipeline.py`는 seg 끔(element·probe 단계·`display-mask` 불변)과 seg 켬(`vehicle-inference → vehicle-segmentation → vehicle-tracker`, det src는 OTA 관찰만, seg src는 `attach_masks → prepare_tracks`, 주차장 카메라 OSD만 `display-mask`)을, `tests/test_camera_metadata.py`는 실제 `on_batch`로 윤곽 게시·박스 두께·커버리지 집계를, `backend/tests/test_occupancy.py`는 vehicles API의 `outline` 통과와 형식 오류가 그 차량만 null이 되는지를 검증한다. 실제 nvinfer instance mask, nvdsosd GPU 모드 mask 그리기, tracker 뒤 `mask_params` 유지는 증명하지 않는다(GPU 검증은 [운영](../operations.md#차량-윤곽선seg-선택) G6).
 - `tests/test_pgie_cache.py`는 CPU 파일 fixture로 config 생성, 빌드 조건/후처리 분리, 별도 프로세스의 경로 안정성, 모델 staging 및 config/GObject 일치를 검증한다. 실제 TensorRT serialization은 GPU 서버에서 최초 생성 후 동일 설정으로 재실행하여 canonical engine의 deserialization 로그와 rebuild 부재를 확인해야 한다. Warm nvinfer state transition의 8–9초 지연은 별도 최적화 과제다.
 - `tests/test_preview.py`는 preview를 직접 import하므로 GI/GStreamer/PyDS와 NVIDIA plugin 환경이 필요하다. 전체 tests discovery를 일반 CPU 검증으로 간주하지 않는다.
 - Backend 테스트는 임시 SQLite DB, FastAPI TestClient, httpx MockTransport와 transaction을 사용한다. 실제 PostgreSQL/GPU/RTSP 검증을 대체하지 않는다.

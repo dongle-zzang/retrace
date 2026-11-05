@@ -47,6 +47,7 @@
 | 주차장 카메라 5대만 대상 (b1_parking_entrance, overview, gate, inner, 1f_outdoor_parking) | `b1_parking_tower`는 사용자가 제외하기로 결정했습니다. |
 | 프리뷰 튜닝: mux timeout 33333, 디코더 low-latency, `/ws` 버스트 8 토큰 버킷, `previewVideoFps` 30 | 프리뷰 지연을 줄이기 위해서입니다. 서버 측에서 `main`에 5e0183b로 반영했습니다. |
 | 사람 박스는 서버가 그림 | 프론트가 프레임 위에 따로 그리지 않도록 하는 설계입니다. |
+| 주차장 카메라 차량 윤곽선은 운영 det 가중치를 YOLO11m-seg에 이식한 두 번째 nvinfer로 만들고 `VEHICLE_SEG_INFER_CONFIG`로 켬(기본 끔). `/api/cameras/{id}/vehicles`에 `outline` 추가 | COCO seg는 검출 가지가 COCO YOLO11m과 같아 회사 영상 recall이 0.487이고, det 교체는 미세 조정 정확도(0.908)를 잃기 때문입니다. 이식은 운영 박스를 그대로 재현하고 det·OTA를 건드리지 않습니다(2026-11-05 측정, [설계](superpowers/specs/2026-11-05-vehicle-outline-segmentation-design.md)). |
 | 침묵한 카메라 source bin은 앱이 직접 복구: 1차 제자리 재설정, 2차 mux sink pad 재생성 (`--no-source-recovery`, `--no-source-recovery-rebuild`로 끔) | nvurisrcbin 내부 재연결만으로는 디코더 정지나 not-negotiated 이후 돌아오지 않아 재시작만 통했기 때문입니다(2026-11-03 서버 96시간 로그). 상세는 `docs/operations.md` "source 복구 정책". |
 
 **주차 판정**
@@ -204,6 +205,7 @@
 
 **기능과 운영**
 - [ ] 영상이 나오지 않는 카메라 3대 (2026-11-03 진단, 서버 밖 조치 필요): 5f_server_room·7f_rooftop은 서버에서 RTSP 포트로 TCP 연결 자체가 timeout(전원/케이블/IP/VLAN 확인). 3f_terrace_4k는 RTSP 서비스가 응답하지만 .env 자격 증명으로 DESCRIBE가 401(비밀번호 또는 특수문자 URL 인코딩 확인 후 `docker compose up -d --force-recreate retrace`).
+- [ ] 차량 윤곽선 seg GPU 검증과 운영 적용(코드는 main에 있고 기본 끔): 모델 준비·파서 빌드·engine 미리 빌드 후 재생성, GPU 모드 `display-mask`, 성능 기준(설계 §5). 절차는 `docs/operations.md` "차량 윤곽선(seg, 선택)".
 - [ ] 2차 복구(재생성)의 not-negotiated 사례 실제 복구 확인. 재생성 직후 `GStreamer WARNING factory=` 로그로 거부 element 확정. 수일 운영 후 메모리/`nvidia-smi` 추이 확인.
 - [ ] 모델 삭제 API가 없습니다.
 - [ ] 차량 검출 모드 판정 결과와 임계값이 브라우저에만 저장되고 서버에는 저장되지 않습니다.

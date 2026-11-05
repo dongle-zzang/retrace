@@ -183,6 +183,11 @@ retrace (vehicle_deployment.py, 기존 control loop):
 - 파일: `.cache/vehicle-deployments/{status.json, committed.json, engines/, <job>/(best.pt, best.onnx, labels.txt, manifest.json,
   infer.txt, build.log, build.json, request.json, result.json)}`. 로컬 산출물이며 자동 삭제하지 않는다.
 - engine 생성 중에는 같은 GPU를 쓰므로 Preview FPS가 잠시 내려갈 수 있다(수 분). 학습과 동시에 실행되지 않는다.
+- 차량 윤곽선 seg를 켰으면 상태에 `segmentation_graft`(`match`/`stale`/`unknown`, seg 끔이면 null)가 있다. 이식 seg의
+  det 가중치(seg config 옆 `manifest.json`의 `det_weights_sha256`)와 활성 모델 배포 디렉터리 `manifest.json`의
+  `weights_sha256`을 비교하며, 처음 모델은 비교할 수 없어 `unknown`이다. 새 det를 배포하면 `stale`이 되고 재이식은
+  수동이다([운영](operations.md#차량-윤곽선seg-선택)). worker가 상태 모듈을 다시 읽어야 API에 보인다
+  (`systemctl --user restart retrace-training-worker`).
 
 ## 4-3. 자동 라벨링 job (`config.kind = 'autolabel'`)
 
