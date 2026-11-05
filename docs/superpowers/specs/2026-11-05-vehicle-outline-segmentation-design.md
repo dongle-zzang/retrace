@@ -423,9 +423,11 @@ seg 끔(기준선)과 seg 켬을 비슷한 시간대에 각각 30분 잰다. 같
 - G3 engine 미리 빌드:
   `sudo docker compose exec -T -e VEHICLE_SEG_INFER_CONFIG=models/yolo11m-seg/vehicle_seg_infer.txt retrace python3 tools/build_vehicle_seg_engine.py`
 
-재시작(사용자가 시간 결정):
+재시작(사용자가 시간 결정). 2026-11-05 결정으로 배포를 두 번에 나눈다(절차는 `docs/operations.md` "차량 윤곽선"):
+1차는 seg 없이 재시작해 카메라 복구 감시(f6db046)만 적용하고 G4를 잰다. 하루 동안 `camera_status` 252줄이 유지되면
+2차로 G1 → G2 → G3 → G5 → G6을 한다. G3과 `retrace-training-worker` 재시작은 학습 job이 없을 때 한다.
 
-- G4 seg 끔 상태로 §5 기준선 30분.
+- G4(1차) seg 끔 상태로 §5 기준선 30분.
 - G5 `.env`에 `VEHICLE_SEG_INFER_CONFIG=models/yolo11m-seg/vehicle_seg_infer.txt`를 넣고
   `sudo docker compose up -d --force-recreate retrace`(env_file은 재생성해야 반영). 로그에서 seg engine을 다시 빌드하지 않고
   deserialize했는지 확인.

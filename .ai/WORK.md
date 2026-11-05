@@ -17,7 +17,7 @@
 - 설계와 다른 점(설계 문서 "구현 메모" 참조): ghost pad target은 plugin이 pad-removed 없이 pad를 버린 경우에만 비운다(무조건 비우면 pad가 유지되는 경우 링크가 끊김). `recovery_failed()`도 간격을 120→300→600으로 늘린다.
 - Verified (CPU, `/tmp/retrace-shared-venv/bin/python` 3.11, 2026-11-04): `test_camera_*.py` 84 OK(1단계 75 + 2단계 9), `test_rtsp_inputs.py` 7 OK, 회귀 `test_preview_realtime`, `test_vehicle_deployment`, `test_canonical_startup`, `test_preview_api_writes`, `test_preview_capture` OK. 전체 `discover -s tests` 185 중 오류 1은 GPU 전용 `test_preview.py` import(기존). `git diff --check` 통과. `attach_source` 분리 직후 기존 `construct()` 테스트가 그대로 통과함을 먼저 확인했다.
 - NOT verified: DS 7.0 실환경에서 PLAYING 중 legacy nvstreammux `sink_N` release/재요청 후 재협상, mux pad 제거 시 demux `src_N`으로 EOS가 실제로 오는지, 재생성 후 tracker per-stream 상태, 도달 불가 3대의 10분 주기 재생성이 메모리에 주는 영향. 어느 element가 거부하는지는 재생성 직후 WARNING `factory=` 로그로 확정 예정.
-- Next action: 사용자 확인 후 재시작 가능한 시간에 3단계 배포. 배포 직후 `camera_status` 252줄 확인, 이후 `source_recovery_(hung|unblocked|abandoned)` 발생 시 traceback의 멈춘 줄을 3단계 설계 §1 Not verified에 기록(§6 GPU 검증). 그 뒤 2단계 관찰을 이어간다: 자연 발생 대기([11-04 설계](../docs/superpowers/specs/2026-11-04-camera-source-rebuild-design.md) §6). 3대 외 카메라에서 `source_reset` → 120초 뒤 `source_rebuild` → `NVMM video pad linked` → online이 확인되면 이 작업을 idle로 되돌리고 project-status §5의 관찰 항목을 닫는다. 그 직후 WARNING `factory=` 로그로 거부 element를 기록한다. 수일 후 메모리/`nvidia-smi` 추이 확인. 문제가 생기면 `--no-source-recovery-rebuild`로 1단계만 남긴다. 3대 원인(네트워크 도달 불가 2, 인증 거절 1)은 project-status §5에 기록했고 서버 밖 조치다.
+- Next action: 사용자 확인 후 재시작 가능한 시간에 3단계 배포(= 아래 윤곽선 작업의 1차 배포, seg 없이 재시작하고 G4 기준선 측정). 배포 직후 `camera_status` 252줄 확인, 이후 `source_recovery_(hung|unblocked|abandoned)` 발생 시 traceback의 멈춘 줄을 3단계 설계 §1 Not verified에 기록(§6 GPU 검증). 그 뒤 2단계 관찰을 이어간다: 자연 발생 대기([11-04 설계](../docs/superpowers/specs/2026-11-04-camera-source-rebuild-design.md) §6). 3대 외 카메라에서 `source_reset` → 120초 뒤 `source_rebuild` → `NVMM video pad linked` → online이 확인되면 이 작업을 idle로 되돌리고 project-status §5의 관찰 항목을 닫는다. 그 직후 WARNING `factory=` 로그로 거부 element를 기록한다. 수일 후 메모리/`nvidia-smi` 추이 확인. 문제가 생기면 `--no-source-recovery-rebuild`로 1단계만 남긴다. 3대 원인(네트워크 도달 불가 2, 인증 거절 1)은 project-status §5에 기록했고 서버 밖 조치다.
 - Blockers: none.
 
 ## 두 번째 작업: 주차장 카메라 차량 윤곽선(instance mask) (2026-11-05 시작)
@@ -29,7 +29,7 @@
 - 근거 측정(CPU, 회사 test split 10장/GT 76): COCO YOLO11m-seg recall 0.487(검출 가지가 COCO YOLO11m과 텐서 649개 동일), 이식 seg 0.908(운영 박스 80/80 재현), 이식 vs COCO mask IoU 0.90. 32점 행 스캔 윤곽 IoU 0.836(cv2 approxPolyDP 0.829).
 - NOT verified (GPU, 설계 §2-1·§7-2): secondary nvinfer instance mask 실제 부착, custom TRT plugin을 native ONNX builder가 찾는지(G3), nvdsosd GPU 모드 `display-mask`와 색, 두께 0 박스가 안 그려지는지, tracker 뒤 `mask_params` 유지, 성능(§5: FPS 합계 ≥95%·카메라별 ≥90%, VRAM +1.5 GiB 이하·여유 ≥8 GiB, GPU 중앙값 ≤60%, probe ≤50 ms/s·batch ≤10 ms, 커버리지 ≥0.8), 24시간 메모리.
 - 측정 기록 자리(G4/G6 결과를 여기에): 기준선 — / seg 켬 — / `vehicle_masks` — / VRAM·GPU — .
-- Next action: 사용자가 `docs/operations.md`의 G1(호스트) → G2·G3(`sudo docker compose exec`) → G4 기준선 → G5 `.env` 설정 후 `sudo docker compose up -d --force-recreate retrace` → G6 확인·측정. 결과를 위 자리에 기록하고 G6 뒤 `VEHICLE_OUTLINE_BOX_WIDTH` 기본값을 사용자가 정한다. 문제가 있으면 `.env` 값을 비우고 재생성.
+- Next action (2026-11-05 결정, 두 번 배포, 절차는 `docs/operations.md` "차량 윤곽선"): 1차 — `VEHICLE_SEG_INFER_CONFIG` 없이 재시작해 3단계 복구 감시(f6db046)만 적용하고, 이 상태의 30분 측정을 G4 기준선으로 쓴다. 2차 — 하루 관찰 후 `camera_status` 252줄이 유지되면 G1 → G2 → G3 → G5 → G6. G3과 `retrace-training-worker` 재시작은 학습 job이 없을 때. 결과를 위 자리에 기록하고 G6 뒤 `VEHICLE_OUTLINE_BOX_WIDTH` 기본값을 사용자가 정한다. 문제가 있으면 `.env` 값을 비우고 재생성.
 
 ## 원인 조사 결과 (2026-11-03, 서버 96시간 로그)
 
@@ -51,3 +51,5 @@
   - 서버 `main`이 최신인지, `frontend-dist/`가 현재 빌드와 같은지 확인.
   - 영상이 나오지 않는 카메라 3대 원인 확인(ID는 project-status §5).
   - 모델 삭제 API 없음. 차량 검출 판정 결과·임계값은 브라우저에만 저장됨(서버 저장은 별도 설계 필요).
+- 알려진 위험:
+  - backend poller(`backend/app/ingest.py` `poll_once`)는 `/metadata.json`의 frame 하나라도 `FrameIn` 검증에 실패하면 그 tick의 모든 카메라 frame을 버린다(`frames = []`). 2026-11-05 윤곽선 작업 범위 밖이라 그대로 둠(`outline` 형식 오류만 그 차량 null로 완화).

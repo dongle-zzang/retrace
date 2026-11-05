@@ -178,6 +178,31 @@ seg 준비가 실패하면 `Vehicle segmentation unavailable; details hidden; ou
 `models/yolo11m-seg/`(gitignore)에 둡니다: DeepStream-Yolo-Seg clone(commit `a8ec7ec`, MIT, 저장소 patch 적용),
 `graft.pt`·`manifest.json`(이식), `graft.onnx`·`labels.txt`(export), `vehicle_seg_infer.txt`.
 
+배포는 두 번에 나눕니다(2026-11-05 결정). 카메라 복구 감시(f6db046)와 seg를 한 번에 켜면 문제가 생겼을 때 원인을
+나눌 수 없고, 복구 감시만 적용된 상태가 seg 측정의 기준선이 되어야 하기 때문입니다.
+
+**1차: seg 없이 재시작(카메라 복구 감시만 적용)**
+
+1. 서버 checkout을 main 최신으로 맞춥니다(아래 "GitHub main workflow"). `.env`에 seg 값이 없어야 합니다:
+   `grep -c '^VEHICLE_SEG_INFER_CONFIG=.' .env`가 0.
+2. `sudo docker compose up -d --force-recreate retrace`. 시작 로그에 `vehicle_segmentation` 줄이 없어야 합니다(seg 끔).
+3. 몇 분 뒤 `sudo docker compose logs -t --since=1m retrace | grep -c camera_status`가 252 전후인지 봅니다
+   (아래 "복구 감시" 일일 확인과 같음).
+4. G4. 이 상태로 30분 기준선을 잽니다(아래 측정, 보고 파일 `seg-off.json`). 결과는 `.ai/WORK.md`의 측정 기록 자리에
+   적습니다.
+
+**2차: seg 켜기(1차 뒤 하루 관찰)**
+
+진행 조건: 1차 재시작 뒤 하루 동안 위 `camera_status` 수가 252 전후로 유지됩니다. 0이 나온 적이 있으면 2차를 미루고
+복구 감시 문제를 먼저 봅니다. 순서는 G1 → G2 → G3 → G5 → G6입니다(G4는 1차에서 끝남).
+
+주의: G3과 `retrace-training-worker` 재시작은 학습·자동 라벨링 job이 없을 때 합니다. G3 engine 빌드는 학습과 같은
+GPU를 쓰고, worker 재시작은 진행 중인 job을 끊을 수 있습니다. 시작 전에 아래가 `None`인지 확인합니다.
+
+```bash
+curl -s http://127.0.0.1:8000/api/training/status | python3 -c "import json,sys; print(json.load(sys.stdin)['active_job'])"
+```
+
 G1. 호스트에서 모델 준비(운영 영향 없음, CPU로 실행):
 
 ```bash
@@ -225,7 +250,7 @@ pre-cluster-threshold=0.1
 
 G2. 파서 빌드(컨테이너): `sudo docker compose exec -T retrace bash -lc 'cd models/yolo11m-seg/DeepStream-Yolo-Seg && CUDA_VER=12.2 make -C nvdsinfer_custom_impl_Yolo_seg'`
 
-G3. engine 미리 빌드(별도 프로세스, 실행 중 pipeline은 그대로, 빌드 동안 GPU를 씀):
+G3. engine 미리 빌드(별도 프로세스, 실행 중 pipeline은 그대로, 빌드 동안 GPU를 씀. 학습 job이 없을 때, 위 주의):
 
 ```bash
 sudo docker compose exec -T -e VEHICLE_SEG_INFER_CONFIG=models/yolo11m-seg/vehicle_seg_infer.txt retrace python3 tools/build_vehicle_seg_engine.py
@@ -233,20 +258,22 @@ sudo docker compose exec -T -e VEHICLE_SEG_INFER_CONFIG=models/yolo11m-seg/vehic
 
 `vehicle_segmentation graft=...`와 `Engine ready: .cache/vehicle-seg/pgie/...`가 나와야 합니다.
 
-G4. seg 끔 상태로 30분 기준선을 잽니다(아래 측정). G5. `.env`에 `VEHICLE_SEG_INFER_CONFIG=models/yolo11m-seg/vehicle_seg_infer.txt`를
+G5. `.env`에 `VEHICLE_SEG_INFER_CONFIG=models/yolo11m-seg/vehicle_seg_infer.txt`를
 넣고 `sudo docker compose up -d --force-recreate retrace`(env_file 변경은 재생성해야 반영). 로그에 seg engine
 build 없이 deserialize가 나오고 `vehicle_segmentation graft=match`인지 봅니다.
-OTA 상태 API에 `segmentation_graft`를 보이려면 `systemctl --user restart retrace-training-worker`가 필요합니다.
+OTA 상태 API에 `segmentation_graft`를 보이려면 `systemctl --user restart retrace-training-worker`가 필요합니다
+(학습 job이 없을 때, 위 주의).
 
 G6. 확인: 주차장 카메라 JPEG에 윤곽선과 얇은 박스(GPU 모드 `display-mask`와 색), 화면 가장자리 차량의 윤곽 위치,
 `curl -s http://127.0.0.1:8000/api/cameras/b1_parking_overview/vehicles`의 `outline`, `VEHICLE_OUTLINE_BOX_WIDTH=0`으로
 재생성했을 때 박스가 사라지고 글자가 같은 자리에 남는지, 24시간 RSS·VRAM 추이.
 
-측정(seg 끔/켬 각 30분, 허용 기준은 설계 §5):
+측정(seg 끔은 1차 G4, 켬은 2차 G6, 각 30분, 허용 기준은 설계 §5). 보고 파일은 G4에서 `seg-off.json`, G6에서
+`seg-on.json`입니다:
 
 ```bash
 sudo docker compose logs -t --since=30m retrace | grep -E ' fps=|stage=vehicle(-seg)?-batch|^.*vehicle_masks '
-sudo docker compose exec -T retrace python3 tools/measure_preview.py --seconds 600 --report .cache/measure/seg-on.json
+sudo docker compose exec -T retrace python3 tools/measure_preview.py --seconds 600 --report .cache/measure/seg-off.json
 timeout 600 nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader -l 1   # 호스트
 top -b -d 5 -n 120 -p "$(pgrep -f 'preview.py --cameras' | tail -1)"            # 호스트
 ```
