@@ -47,6 +47,7 @@
 | 주차장 카메라 5대만 대상 (b1_parking_entrance, overview, gate, inner, 1f_outdoor_parking) | `b1_parking_tower`는 사용자가 제외하기로 결정했습니다. |
 | 프리뷰 튜닝: mux timeout 33333, 디코더 low-latency, `/ws` 버스트 8 토큰 버킷, `previewVideoFps` 30 | 프리뷰 지연을 줄이기 위해서입니다. 서버 측에서 `main`에 5e0183b로 반영했습니다. |
 | 사람 박스는 서버가 그림 | 프론트가 프레임 위에 따로 그리지 않도록 하는 설계입니다. |
+| 침묵한 카메라 source bin은 앱이 직접 복구: 1차 제자리 재설정, 2차 mux sink pad 재생성 (`--no-source-recovery`, `--no-source-recovery-rebuild`로 끔) | nvurisrcbin 내부 재연결만으로는 디코더 정지나 not-negotiated 이후 돌아오지 않아 재시작만 통했기 때문입니다(2026-11-03 서버 96시간 로그). 상세는 `docs/operations.md` "source 복구 정책". |
 
 **주차 판정**
 
@@ -171,6 +172,7 @@
 **배포 기능과 튜닝**
 - DeepStream 모델 배포(OTA + 롤백) 소스 (7957590, 5c4da59). 기본 비활성 상태입니다.
 - 프리뷰 지연 튜닝 (5e0183b).
+- 카메라 source bin 자동 복구 (1차 재설정 0ef8320, 2차 재생성 35a3b2f, 예외 격리 6461596; 2026-11-03~04). 하루 이상 운영 시 일부 카메라가 웹에서만 안 보이던 문제의 해결입니다. 1차 재설정은 실환경에서 복구 확인(1f_lobby, 6f_lobby), 2차 재생성은 도달 불가 카메라에서 120회 실행·실패 0으로 안정성만 확인했고 not-negotiated 사례의 실제 복구는 관찰 중입니다.
 
 **저장소와 문서**
 - `/`를 `/parking`으로 리다이렉트하고, 모니터링을 `/monitoring`으로 이동.
@@ -201,7 +203,8 @@
 - [ ] COCO car/bus/truck을 `car`로 매핑한 것이 맞는지 확인 필요.
 
 **기능과 운영**
-- [ ] 영상이 나오지 않는 카메라 3대: 3f_terrace_4k, 5f_server_room, 7f_rooftop. 원인은 확인 필요.
+- [ ] 영상이 나오지 않는 카메라 3대 (2026-11-03 진단, 서버 밖 조치 필요): 5f_server_room·7f_rooftop은 서버에서 RTSP 포트로 TCP 연결 자체가 timeout(전원/케이블/IP/VLAN 확인). 3f_terrace_4k는 RTSP 서비스가 응답하지만 .env 자격 증명으로 DESCRIBE가 401(비밀번호 또는 특수문자 URL 인코딩 확인 후 `docker compose up -d --force-recreate retrace`).
+- [ ] 2차 복구(재생성)의 not-negotiated 사례 실제 복구 확인. 재생성 직후 `GStreamer WARNING factory=` 로그로 거부 element 확정. 수일 운영 후 메모리/`nvidia-smi` 추이 확인.
 - [ ] 모델 삭제 API가 없습니다.
 - [ ] 차량 검출 모드 판정 결과와 임계값이 브라우저에만 저장되고 서버에는 저장되지 않습니다.
 - [ ] 인증이 공유 토큰 방식뿐입니다.
@@ -214,6 +217,7 @@
 | --- | --- |
 | 백엔드 `PermissionError`로 크래시 루프가 생기고 502 발생 | `chmod -R a+rX backend/app camera_config.py` 실행 후 재빌드. `frontend-dist`와 `training`도 같은 조치가 필요합니다. |
 | evaluate 작업에서 `KeyError 'epochs'` | 예전 워커가 떠 있는 상태이므로 워커를 재시작합니다. |
+| 카메라는 정상인데 웹에서 일부만 "No video from camera (offline)" | 앱이 자동 복구합니다(`source_reset` → 120초 뒤 `source_rebuild` 로그, `/streams.json`의 `recovery_count`). `recovery_count`만 늘고 online이 안 되면 `docker compose logs -t retrace \| grep -E 'source_re\|WARNING factory='`를 수집한 뒤 `docker compose restart retrace`. |
 | `/api/training/auth`가 415 반환 | `{}` 본문과 `Content-Type: application/json`을 함께 보냅니다. |
 
 ---
