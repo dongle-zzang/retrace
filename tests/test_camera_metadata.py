@@ -128,9 +128,12 @@ class MetadataTests(unittest.TestCase):
 
 class ProbeIntegrationTests(unittest.TestCase):
     """Execute the production tracker probe with synthetic linked PyDS metadata."""
-    def test_multi_source_probe_keeps_osd_and_detaches_metadata(self):
+    def probe_scenario(self, segmenter=None, mask=None):
+        """Run the real on_batch on camera_0 (no detector) and camera_1 (one tracked car)."""
         import ast
         import threading
+        import time
+        from vehicle_detection import vehicle_outline
         from camera_config import Camera
         from camera_runtime import CameraRuntime, CameraRuntimeManager
         from preview_mjpeg import FrameStore
@@ -141,6 +144,7 @@ class ProbeIntegrationTests(unittest.TestCase):
         run = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'run_shared_pipeline')
         functions = [node for node in run.body if isinstance(node, ast.FunctionDef)
                      and node.name in {'camera_for_frame', 'on_batch'}]
+        functions += [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'detach_vehicle']
         store = MetadataStore()
         frames = [NS(source_id=i, pad_index=i, frame_num=10, buf_pts=100, bInferDone=True,
                      obj_meta_list=None) for i in range(2)]
@@ -152,6 +156,8 @@ class ProbeIntegrationTests(unittest.TestCase):
         car.unique_component_id, car.class_id = VEHICLE_GIE_ID, VEHICLE_TRACKER_CLASS
         car.rect_params.border_color = color
         car.text_params = NS()
+        if mask is not None:
+            car.mask_params = mask
         frames[1].obj_meta_list = NS(data=stray, next=NS(data=car, next=None))
         batch = NS(frame_meta_list=NS(data=frames[0], next=NS(data=frames[1], next=None)))
         failures, removed = [], []
@@ -179,10 +185,45 @@ class ProbeIntegrationTests(unittest.TestCase):
             'pipeline_stop': threading.Event(), 'manager': manager,
             'vehicle_detector': NS(cameras={'camera_1'}, car_class_id=0),
             'fail': lambda *args: failures.append(args),
+            'segmenter': segmenter, 'vehicle_outline': vehicle_outline, 'time': time,
+            'mask_stats': {'cameras': {}}, 'costs': [],
         }
+        namespace['record_mask_cost'] = lambda seconds, errors=0: namespace['costs'].append((seconds, errors))
         exec(compile(ast.Module(body=functions, type_ignores=[]), 'preview.py', 'exec'), namespace)
         namespace['on_batch'](None, NS(get_buffer=lambda: 100))
+        return NS(namespace=namespace, store=store, car=car, failures=failures, removed=removed, stray=stray,
+                  frames=frames)
+
+    def test_segmentation_outline_reaches_metadata_and_thins_the_box(self):
+        import numpy as np
+        grid = np.zeros((10, 20), bool)
+        grid[2:8, 3:17] = True
+        data = grid.astype(np.float32).ravel()
+        mask = NS(size=data.nbytes, width=20, height=10, threshold=.5, get_mask_array=lambda: data)
+        segmenter = NS(cameras=frozenset({'camera_1'}), box_width=0)
+        run = self.probe_scenario(segmenter, mask)
+        self.assertEqual(run.failures, [])
+        vehicle = run.store.snapshot()[8].vehicles[0]
+        self.assertIsNotNone(vehicle.outline)
+        self.assertLessEqual(len(vehicle.outline), 32)
+        self.assertEqual(run.car.rect_params.border_width, 0)
+        self.assertEqual(run.car.text_params.display_text, 'Vehicle')
+        self.assertEqual(run.namespace['mask_stats']['cameras'], {'camera_1': (1, 1)})
+        self.assertEqual(len(run.namespace['costs']), 1)
+        mask.size = 0  # this car got no mask from the seg nvinfer
+        run = self.probe_scenario(segmenter, mask)
+        self.assertIsNone(run.store.snapshot()[8].vehicles[0].outline)
+        self.assertEqual(run.car.rect_params.border_width, 3)
+        self.assertEqual(run.namespace['mask_stats']['cameras'], {'camera_1': (1, 0)})
+
+    def test_multi_source_probe_keeps_osd_and_detaches_metadata(self):
+        run = self.probe_scenario()
+        namespace, store, car, failures, removed, stray, frames = (
+            run.namespace, run.store, run.car, run.failures, run.removed, run.stray, run.frames)
         self.assertEqual(failures, [])
+        self.assertIsNone(store.snapshot()[8].vehicles[0].outline)  # segmentation off
+        self.assertEqual(car.rect_params.border_width, 3)
+        self.assertEqual((namespace['costs'], namespace['mask_stats']), ([], {'cameras': {}}))
         self.assertEqual(namespace['counts'], [1, 1])
         self.assertEqual(namespace['vehicle_counts'], [None, 1])
         self.assertEqual(removed, [stray])

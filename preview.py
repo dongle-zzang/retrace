@@ -32,6 +32,7 @@ from camera_config import CameraConfigError, load_cameras
 from camera_runtime import CameraRuntime, CameraRuntimeManager
 from person_metadata import FrameMetadata, MetadataStore, vehicle_from_object, utc_timestamp
 from vehicle_detection import (prepare_vehicle_detector, add_vehicle_rois, prepare_vehicle_tracks,
+                               prepare_vehicle_segmenter, attach_vehicle_masks, vehicle_outline, graft_status,
                                VEHICLE_GIE_ID, VEHICLE_TRACKER_CLASS)
 from preview_diagnostics import InferenceDiagnostics, log_safe_traceback, log_settings
 from startup_timing import StartupTiming, startup_origin, source_observer, bus_observer
@@ -364,8 +365,23 @@ def make_tracker():
     return tracker
 
 
-def build_output(index, args, store, fail):
-    """Draw the existing OSD result and publish only the latest encoded JPEG."""
+def detach_vehicle(obj, camera_id, timestamp, class_id, outline=None, box_width=1):
+    """Copy one tracked vehicle; its OSD box is box_width when it has an outline, else the usual 3.
+
+    The label stays: nvdsosd places text from text_params, not from the box border.
+    """
+    obj.rect_params.border_width = 3 if outline is None else box_width
+    obj.rect_params.border_color.set(1.0, 0.65, 0.0, 1.0)
+    # OSD shows the class only; track_id stays in metadata for occupancy.
+    obj.text_params.display_text = "Vehicle"
+    return vehicle_from_object(camera_id, timestamp, obj, class_id, outline)
+
+
+def build_output(index, args, store, fail, display_mask=False):
+    """Draw the existing OSD result and publish only the latest encoded JPEG.
+
+    display_mask draws vehicle masks (the outline rings from the seg nvinfer) on parking cameras.
+    """
     output_bin = Gst.Bin.new(f"mjpeg-source-{index}")
     if output_bin is None:
         raise RuntimeError(f"source={index}: could not create output bin")
@@ -382,7 +398,7 @@ def build_output(index, args, store, fail):
         osd.set_property("process-mode", 1)
         osd.set_property("display-bbox", True)
         osd.set_property("display-text", True)
-        osd.set_property("display-mask", False)
+        osd.set_property("display-mask", display_mask)
         converter = make_element("nvvideoconvert", f"convert-mjpeg-{index}")
         raw_caps = make_element("capsfilter", f"raw-caps-mjpeg-{index}")
         raw_caps.set_property("caps", Gst.Caps.from_string(
@@ -457,6 +473,7 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
     """
     startup = getattr(args, "startup_timing", None)
     vehicle_detector = getattr(args, "vehicle_detector", None)
+    segmenter = getattr(args, "vehicle_segmenter", None) if vehicle_detector is not None else None
     if startup is not None:
         startup.start_gpu_sampling()
     cameras_by_source = manager.cameras_by_slot
@@ -485,6 +502,18 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
                         if camera.camera_id in vehicle_detector.cameras}
                        if args.diagnostics and vehicle_detector is not None else {})
     metadata_samples = {}  # At most five vehicles from the latest nonempty frame per report.
+    # Seg probe + outline cost and coverage per report window (guarded by counts_lock).
+    mask_stats = {"cameras": {}, "seconds": 0.0, "max": 0.0, "errors": 0}
+
+    def record_mask_cost(seconds, errors=0):
+        with counts_lock:
+            mask_stats["seconds"] += seconds
+            mask_stats["max"] = max(mask_stats["max"], seconds)
+            mask_stats["errors"] += errors
+
+    def detector_config():
+        # The OTA-active detector config sits beside its weights manifest; the original model has none.
+        return ROOT / deployment.active["config"] if deployment is not None else vehicle_detector.config_path
 
     def camera_for_frame(frame):
         return manager.camera_for_frame(int(frame.source_id), int(frame.pad_index))
@@ -644,6 +673,15 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
                 if sample is not None:
                     print("metadata " + json.dumps(sample.to_dict(), ensure_ascii=False,
                                                    separators=(',', ':'), allow_nan=False), flush=True)
+            if segmenter is not None:
+                with counts_lock:
+                    masks = {**mask_stats, "cameras": dict(mask_stats["cameras"])}
+                    mask_stats.update(cameras={}, seconds=0.0, max=0.0, errors=0)
+                print("vehicle_masks " + json.dumps({
+                    "cameras": {camera: {"vehicles": n, "with_outline": k} for camera, (n, k) in masks["cameras"].items()},
+                    "probe_ms_per_s": round(masks["seconds"] * 1000 / elapsed, 2),
+                    "probe_max_ms": round(masks["max"] * 1000, 2), "errors": masks["errors"],
+                    "graft": graft_status(segmenter, detector_config())}, separators=(",", ":")), flush=True)
         previous_counts[:] = snapshot
         previous_time = now
         for (stage, source), counter in timings.items():
@@ -663,6 +701,7 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
             if batch is None:
                 raise RuntimeError("Tracker output has no DeepStream batch metadata")
             frame_list = batch.frame_meta_list
+            outline_seconds = 0.0
             while frame_list is not None:
                 frame = pyds.NvDsFrameMeta.cast(frame_list.data)
                 camera = camera_for_frame(frame)
@@ -677,6 +716,7 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
                     continue
                 timestamp = utc_timestamp()
                 vehicles = []
+                with_outline = 0
                 vehicle_enabled = vehicle_detector is not None and camera.camera_id in vehicle_detector.cameras
                 object_list = frame.obj_meta_list
                 while object_list is not None:
@@ -688,11 +728,14 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
                         next_object = None
                     if (vehicle_enabled and obj.unique_component_id == VEHICLE_GIE_ID
                             and obj.class_id == VEHICLE_TRACKER_CLASS):
-                        vehicles.append(vehicle_from_object(camera.camera_id, timestamp, obj, vehicle_detector.car_class_id))
-                        obj.rect_params.border_width = 3
-                        obj.rect_params.border_color.set(1.0, 0.65, 0.0, 1.0)
-                        # OSD shows the class only; track_id stays in metadata for occupancy.
-                        obj.text_params.display_text = "Vehicle"
+                        outline = None
+                        if segmenter is not None:
+                            started = time.perf_counter()
+                            outline = vehicle_outline(obj)
+                            outline_seconds += time.perf_counter() - started
+                            with_outline += outline is not None
+                        vehicles.append(detach_vehicle(obj, camera.camera_id, timestamp, vehicle_detector.car_class_id,
+                                                       outline, segmenter.box_width if segmenter else 1))
                     else:
                         pyds.nvds_remove_obj_meta_from_frame(frame, obj)
                     object_list = next_object
@@ -721,10 +764,15 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
                     if vehicle_enabled:
                         vehicle_counts[index] = len(vehicles)
                         vehicles_max[index] = max(vehicles_max[index], len(vehicles))
+                        if segmenter is not None:
+                            seen, outlined = mask_stats["cameras"].get(camera.camera_id, (0, 0))
+                            mask_stats["cameras"][camera.camera_id] = (seen + len(vehicles), outlined + with_outline)
                 try:
                     frame_list = frame_list.next
                 except StopIteration:
                     break
+            if segmenter is not None:
+                record_mask_cost(outline_seconds)
         except Exception:
             fail("Metadata/OSD preparation failed; details hidden", str(index))
         return Gst.PadProbeReturn.OK
@@ -1011,32 +1059,57 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
             if os.environ.get("VEHICLE_DEPLOYMENT_ENABLED") == "1":
                 try:
                     from vehicle_deployment import DeploymentController
-                    deployment = DeploymentController(vehicle, vehicle_detector, manager)
+                    deployment = DeploymentController(vehicle, vehicle_detector, manager, segmenter=segmenter)
                 except Exception:
                     # Opt-in feature: the configured production model keeps running without it.
                     print("Vehicle deployment controller disabled; details hidden", flush=True)
 
-            def vehicle_probe(_pad, info, prepare):
+            def vehicle_probe(_pad, info, steps):
                 try:
                     buffer = info.get_buffer()
                     if buffer is not None:
                         batch = pyds.gst_buffer_get_nvds_batch_meta(hash(buffer))
                         if batch is None:
                             raise ValueError("Missing vehicle batch")
-                        if deployment is not None and prepare is prepare_vehicle_tracks:
-                            try:
-                                deployment.observe_batch(batch, camera_for_frame, pyds)
-                            except Exception:
-                                pass  # verification then sees no inference evidence and rolls back
-                        prepare(batch, vehicle_detector, camera_for_frame, pyds)
+                        for step in steps:
+                            step(batch)
                 except Exception:
                     fail("Vehicle metadata preparation failed; details hidden")
                 return Gst.PadProbeReturn.OK
 
-            vehicle.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, vehicle_probe, add_vehicle_rois)
-            vehicle.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, vehicle_probe, prepare_vehicle_tracks)
+            def add_rois(batch):
+                add_vehicle_rois(batch, vehicle_detector, camera_for_frame, pyds)
+
+            def observe_deployment(batch):
+                if deployment is not None:
+                    try:
+                        deployment.observe_batch(batch, camera_for_frame, pyds)
+                    except Exception:
+                        pass  # verification then sees no inference evidence and rolls back
+
+            def prepare_tracks(batch):
+                prepare_vehicle_tracks(batch, vehicle_detector, camera_for_frame, pyds)
+
+            def attach_masks(batch):
+                started = time.perf_counter()
+                errors = attach_vehicle_masks(batch, vehicle_detector, segmenter, camera_for_frame, pyds)
+                record_mask_cost(time.perf_counter() - started, errors)
+
+            vehicle.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, vehicle_probe, (add_rois,))
+            # Seg infers the same ROIs after the detector, so ROI removal waits for its output.
+            vehicle.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, vehicle_probe,
+                                                    (observe_deployment,) if segmenter else (observe_deployment, prepare_tracks))
             add_timing_probe(vehicle.get_static_pad("src"), "vehicle-batch", "all")
             shared = (mux, vehicle, tracker, demux)
+            if segmenter is not None:
+                seg = make_element("nvinfer", "vehicle-segmentation")
+                configure_pgie(seg, segmenter.config_path, len(segmenter.cameras))
+                seg.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, vehicle_probe, (attach_masks, prepare_tracks))
+                add_timing_probe(seg.get_static_pad("src"), "vehicle-seg-batch", "all")
+                shared = (mux, vehicle, seg, tracker, demux)
+                graft = graft_status(segmenter, detector_config())
+                print("WARNING vehicle_segmentation graft=stale; re-run the graft for the active detector; details hidden"
+                      if graft == "stale" else f"vehicle_segmentation graft={graft}", flush=True)
         for element in shared:
             pipeline.add(element)
         for left, right in zip(shared, shared[1:]):
@@ -1063,6 +1136,7 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
             output_bin = build_output(
                 index, args, CameraFrameSink(stores[cameras_by_source[index].source_id], manager, index),
                 lambda reason, i=index: fail("pipeline_error", str(i)),
+                display_mask=segmenter is not None and cameras_by_source[index].camera_id in segmenter.cameras,
             )
             startup_probe(output_bin.get_by_name(f"jpeg-encoder-{index}").get_static_pad("src"),
                           "first_jpeg", index)
@@ -1215,6 +1289,9 @@ def run(args, metadata_store=None, runtime_statuses=None):
     except Exception:
         args.vehicle_detector = None
         print("Vehicle detector unavailable; configuration/model details hidden; parking remains unknown", flush=True)
+    # Never raises: a broken seg setup only disables outlines.
+    args.vehicle_segmenter = (prepare_vehicle_segmenter(args.vehicle_detector, cache)
+                              if args.vehicle_detector is not None else None)
     if startup is not None:
         startup.mark("infer_config_ready")
     for camera in args.cameras:

@@ -38,14 +38,17 @@ class PersonMetadata:
 
 @dataclass(frozen=True)
 class VehicleMetadata(PersonMetadata):
+    # Closed polygon ((x, y), ...) in the same mux pixels as bbox; None without a mask or with seg off.
+    outline: tuple[tuple[float, float], ...] | None = None
+
     def to_dict(self):
         return {**asdict(self), "class": "vehicle"}
 
 
-def vehicle_from_object(camera_id, timestamp, obj, class_id):
+def vehicle_from_object(camera_id, timestamp, obj, class_id, outline=None):
     person = person_from_object(camera_id, timestamp, obj)
     return VehicleMetadata(camera_id, timestamp, person.track_id, class_id, person.confidence,
-                           person.bbox, person.tracker_confidence)
+                           person.bbox, person.tracker_confidence, outline)
 
 
 @dataclass(frozen=True)

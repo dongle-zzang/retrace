@@ -28,29 +28,33 @@ def main():
     with path.open('w') as stream:
         config.write(stream, space_around_delimiters=False)
     engine = Path(config['property']['model-engine-file'])
-    if not engine.is_file():
-        import gi
-        gi.require_version('Gst', '1.0')
-        from gi.repository import Gst
-        Gst.init(None)
-        element = Gst.ElementFactory.make('nvinfer', 'candidate-builder')
-        if element is None:
-            return 1
-        element.set_property('config-file-path', str(path))
-        try:
-            # READY -> PAUSED creates the NvDsInfer context, which serializes the engine.
-            if element.set_state(Gst.State.PAUSED) == Gst.StateChangeReturn.FAILURE:
-                return 1
-            if element.get_state(BUILD_TIMEOUT * Gst.SECOND)[0] == Gst.StateChangeReturn.FAILURE:
-                return 1
-        finally:
-            element.set_state(Gst.State.NULL)
+    if not engine.is_file() and not serialize_engine(path):
+        return 1
     if not engine.is_file() or not engine.stat().st_size:
         print('nvinfer did not serialize the expected engine', flush=True)
         return 1
     write_json(args.job / 'build.json', {'engine': relative(engine), 'sha256': digest(engine), 'onnx_sha256': onnx_sha})
     print(f'Engine ready: {relative(engine)}', flush=True)
     return 0
+
+
+def serialize_engine(config_path, timeout=None):
+    """Standalone nvinfer element, never a live one; True unless the state change failed."""
+    import gi
+    gi.require_version('Gst', '1.0')
+    from gi.repository import Gst
+    Gst.init(None)
+    element = Gst.ElementFactory.make('nvinfer', 'candidate-builder')
+    if element is None:
+        return False
+    element.set_property('config-file-path', str(config_path))
+    try:
+        # READY -> PAUSED creates the NvDsInfer context, which serializes the engine.
+        if element.set_state(Gst.State.PAUSED) == Gst.StateChangeReturn.FAILURE:
+            return False
+        return element.get_state((timeout or BUILD_TIMEOUT) * Gst.SECOND)[0] != Gst.StateChangeReturn.FAILURE
+    finally:
+        element.set_state(Gst.State.NULL)
 
 
 BUILD_TIMEOUT = 1800

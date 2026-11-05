@@ -18,7 +18,7 @@ import sys
 import time
 from uuid import uuid4
 
-from vehicle_detection import VEHICLE_GIE_ID, metadata_nodes
+from vehicle_detection import VEHICLE_GIE_ID, graft_status, metadata_nodes
 
 ROOT = Path(__file__).resolve().parent
 DIRECTORY = ROOT / '.cache' / 'vehicle-deployments'
@@ -45,7 +45,7 @@ ROLLBACK_ADVISORY = frozenset({'fps_below_baseline', 'service_fps_below_baseline
                                'camera_went_offline'})
 LIVE = ('online', 'degraded')
 PUBLIC = ('active', 'previous', 'operation', 'phase', 'error', 'evidence', 'service', 'checks', 'failures', 'verified',
-          'active_class_map', 'diagnosis')
+          'active_class_map', 'diagnosis', 'segmentation_graft')
 REPORT = ('operation', 'phase', 'error', 'evidence', 'service', 'checks', 'failures', 'diagnosis')
 
 
@@ -146,12 +146,13 @@ def candidate_config(base_config, onnx, cache_dir, prepare=None):
 class DeploymentController:
     """tick runs on Preview's existing control loop; probes only record observations."""
     def __init__(self, element, detector, manager, directory=DIRECTORY, clock=time.monotonic, wall=time.time,
-                 configure=None, prepare=None):
+                 configure=None, prepare=None, segmenter=None):
         if configure is None:
             from pgie_cache import configure_pgie as configure
         self.element, self.detector, self.manager = element, detector, manager
         self.directory, self.clock, self.wall = Path(directory), clock, wall
         self.configure, self.prepare = configure, prepare
+        self.segmenter = segmenter  # optional seg nvinfer, grafted from some det weights (see graft_status)
         self.config = configuration(detector.config_path)
         self.signature = contract(self.config)
         self.session = uuid4().hex
@@ -233,6 +234,8 @@ class DeploymentController:
         props = self.config['property']
         self.state.update(active=self.active['model_id'], previous=self.previous and self.previous['model_id'],
                           active_class_map=self.active.get('class_map'),
+                          segmentation_graft=self.segmenter and graft_status(self.segmenter,
+                                                                             local_path(self.active['config'])),
                           enabled=self.enabled, session=self.session, updated_at=self.wall(),
                           # Private export contract for the worker; the Backend never forwards it.
                           contract=self.signature, onnx=relative(props['onnx-file']),

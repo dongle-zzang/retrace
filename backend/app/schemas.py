@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import math
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -58,6 +59,19 @@ class PersonIn(BaseModel):
 
 class VehicleIn(PersonIn):
     class_id: int = Field(ge=0)
+    # Pixel polygon in bbox coordinates. An invalid outline only nulls itself: one invalid frame
+    # would make the poller drop every camera's frame.
+    outline: list[tuple[float, float]] | None = None
+
+    @field_validator("outline", mode="before")
+    @classmethod
+    def drop_invalid_outline(cls, value):
+        def finite(number):
+            return isinstance(number, (int, float)) and not isinstance(number, bool) and math.isfinite(number)
+        if (isinstance(value, (list, tuple)) and 3 <= len(value) <= 32
+                and all(isinstance(p, (list, tuple)) and len(p) == 2 and all(map(finite, p)) for p in value)):
+            return value
+        return None
 
 
 class FrameIn(BaseModel):

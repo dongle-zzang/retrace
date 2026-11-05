@@ -1,0 +1,55 @@
+diff --git a/nvdsinfer_custom_impl_Yolo_seg/nvdsparseseg_Yolo.cpp b/nvdsinfer_custom_impl_Yolo_seg/nvdsparseseg_Yolo.cpp
+index 7f104dc..6daac54 100644
+--- a/nvdsinfer_custom_impl_Yolo_seg/nvdsparseseg_Yolo.cpp
++++ b/nvdsinfer_custom_impl_Yolo_seg/nvdsparseseg_Yolo.cpp
+@@ -27,7 +27,7 @@ addSegProposal(const float* output, size_t channelsSize, uint netW, uint netH, s
+   std::memcpy(b.mask, output + n * channelsSize + 6, sizeof(float) * maskSize);
+ }
+ 
+-static void
++static bool
+ addBBoxProposal(float x1, float y1, float x2, float y2, uint netW, uint netH, int maxIndex, float maxProb,
+     NvDsInferInstanceMaskInfo& b)
+ {
+@@ -42,11 +42,12 @@ addBBoxProposal(float x1, float y1, float x2, float y2, uint netW, uint netH, in
+   b.height = clamp(y2 - y1, 0, netH);
+ 
+   if (b.width < 1 || b.height < 1) {
+-      return;
++      return false;
+   }
+ 
+   b.detectionConfidence = maxProb;
+   b.classId = maxIndex;
++  return true;
+ }
+ 
+ static std::vector<NvDsInferInstanceMaskInfo>
+@@ -70,7 +71,11 @@ decodeTensorYoloSeg(const float* output, size_t outputSize, size_t channelsSize,
+ 
+     NvDsInferInstanceMaskInfo b;
+ 
+-    addBBoxProposal(x1, y1, x2, y2, netW, netH, maxIndex, maxProb, b);
++    // retrace: a skipped box left classId/detectionConfidence unset, and nvinfer indexes per-class
++    // filters with classId, so drop it before its mask is allocated.
++    if (!addBBoxProposal(x1, y1, x2, y2, netW, netH, maxIndex, maxProb, b)) {
++      continue;
++    }
+     addSegProposal(output, channelsSize, netW, netH, n, b);
+ 
+     objects.push_back(b);
+diff --git a/utils/export_yolo11_seg.py b/utils/export_yolo11_seg.py
+index 8a14b23..17bd3df 100755
+--- a/utils/export_yolo11_seg.py
++++ b/utils/export_yolo11_seg.py
+@@ -129,6 +129,10 @@ class DeepStreamOutput(nn.Module):
+         box_index = detections_indices.view(total_detections).to(torch.int32)
+ 
+         selected_boxes = boxes[batch_index, box_index]
++        # retrace: the parser clamps boxes to the network frame; RoiAlign on the same clamped xyxy box
++        # keeps masks of vehicles cut by the frame edge aligned with their box.
++        selected_boxes = torch.stack([selected_boxes[:, 0].clamp(0, w_protos * 4), selected_boxes[:, 1].clamp(0, h_protos * 4),
++                                      selected_boxes[:, 2].clamp(0, w_protos * 4), selected_boxes[:, 3].clamp(0, h_protos * 4)], 1)
+         selected_masks = masks[batch_index, box_index]
+ 
+         pooled_proto = RoiAlign.apply(protos, selected_boxes, batch_index, 1, 1, int(h_protos), int(w_protos), 0, 0.25)

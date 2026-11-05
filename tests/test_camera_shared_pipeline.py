@@ -4,6 +4,7 @@ import contextlib
 import io
 from pathlib import Path
 import threading
+import time
 from types import SimpleNamespace as NS
 import unittest
 
@@ -190,6 +191,9 @@ class SharedTests(unittest.TestCase):
             'make_element': Element})
         store = NS(put_frame=lambda data, pts: received.append((data, pts)))
         namespace['build_output'](0, NS(jpeg_quality=80), store, failures.append)
+        self.assertFalse(elements['osd-0'].props['display-mask'])
+        namespace['build_output'](1, NS(jpeg_quality=80), store, failures.append, display_mask=True)
+        self.assertTrue(elements['osd-1'].props['display-mask'])
         self.assertEqual(elements['queue-0'].props['leaky'], 2)
         self.assertEqual(elements['queue-0'].props['max-size-buffers'], 1)
         self.assertFalse(elements['jpeg-sink-0'].props['async'])
@@ -309,6 +313,58 @@ class SharedTests(unittest.TestCase):
 
     def test_vehicle_option_adds_one_camera_selected_detector_before_same_tracker(self):
         self.construct(4, vehicle_enabled=True)
+
+    def test_segmentation_off_keeps_the_vehicle_pipeline_unchanged(self):
+        run = self.construct(3, vehicle_enabled=True)
+        self.assertNotIn('vehicle-segmentation', run['elements'])
+        self.assertEqual(run['display_masks'], {0: False, 1: False, 2: False})
+        self.assertEqual(self.probe_steps(run, 'vehicle-inference', 'src'), ['observe_deployment', 'prepare_tracks'])
+        self.assertNotIn('vehicle_segmentation', run['captured'])
+
+    def test_segmentation_inserts_seg_after_the_detector_and_moves_track_preparation(self):
+        run = self.construct(3, vehicle_enabled=True, segmenter_enabled=True)
+        self.assertEqual(run['elements']['vehicle-segmentation'].props['batch-size'], 2)
+        for link in (('vehicle-inference', 'src', 'vehicle-segmentation', 'sink'),
+                     ('vehicle-segmentation', 'src', 'vehicle-tracker', 'sink')):
+            self.assertIn(link, run['links'])
+        self.assertNotIn(('vehicle-inference', 'src', 'vehicle-tracker', 'sink'), run['links'])
+        self.assertEqual(self.probe_steps(run, 'vehicle-inference', 'sink'), ['add_rois'])
+        self.assertEqual(self.probe_steps(run, 'vehicle-inference', 'src'), ['observe_deployment'])
+        self.assertEqual(self.probe_steps(run, 'vehicle-segmentation', 'src'), ['attach_masks', 'prepare_tracks'])
+        self.assertEqual(run['display_masks'], {0: True, 1: True, 2: False})  # camera_2 is not a parking camera
+        self.assertIn('vehicle_segmentation graft=unknown', run['captured'])
+
+    def test_segmentation_requires_the_vehicle_detector(self):
+        run = self.construct(2, segmenter_enabled=True)
+        self.assertNotIn('vehicle-segmentation', run['elements'])
+        self.assertEqual(run['display_masks'], {0: False, 1: False})
+
+    def probe_steps(self, run, owner, pad):
+        steps = [args[2] for args in run['callbacks'][(owner, pad)] if args[1].__name__ == 'vehicle_probe']
+        self.assertEqual(len(steps), 1)
+        return [step.__name__ for step in steps[0]]
+
+    def test_detached_vehicle_box_is_thin_with_an_outline_and_text_stays(self):
+        from vehicle_detection import vehicle_outline
+        from person_metadata import vehicle_from_object
+        namespace = load_preview({'detach_vehicle'}, {'vehicle_from_object': vehicle_from_object,
+                                                     'vehicle_outline': vehicle_outline})
+        colors = []
+        def tracked():
+            return NS(object_id=5, class_id=100, confidence=.9, tracker_confidence=.8,
+                      rect_params=NS(left=10.0, top=20.0, width=30.0, height=40.0, border_width=3,
+                                     border_color=NS(set=lambda *rgba: colors.append(rgba))),
+                      text_params=NS(display_text=None))
+        outline = ((10.0, 20.0), (40.0, 20.0), (40.0, 60.0), (10.0, 60.0))
+        for width in (0, 1, 3):
+            obj = tracked()
+            vehicle = namespace['detach_vehicle'](obj, 'camera_0', 'now', 2, outline, width)
+            self.assertEqual((obj.rect_params.border_width, obj.text_params.display_text), (width, 'Vehicle'))
+            self.assertEqual((vehicle.outline, vehicle.class_id, vehicle.track_id), (outline, 2, 5))
+        obj = tracked()
+        self.assertIsNone(namespace['detach_vehicle'](obj, 'camera_0', 'now', 2, None, 0).outline)
+        self.assertEqual(obj.rect_params.border_width, 3)  # no outline: the usual thick box
+        self.assertEqual(set(colors), {(1.0, 0.65, 0.0, 1.0)})
 
     def test_diagnostics_installs_mux_and_gpu_stage_probes_without_source_state_waits(self):
         with patch('startup_timing.gpu_memory', return_value=None):
@@ -501,10 +557,12 @@ class SharedTests(unittest.TestCase):
         self.assertTrue(run['workers'][0].is_alive())
         self.assertEqual(run['elements']['preview-detection'].states, ['PLAYING', 'NULL'])
 
-    def construct(self, count, diagnostics=False, vehicle_enabled=False, reset=None, rebuild_enabled=True):
+    def construct(self, count, diagnostics=False, vehicle_enabled=False, reset=None, rebuild_enabled=True,
+                  segmenter_enabled=False):
         manager = self.manager(count)
         test = self  # the fake bus below runs inside Element methods, where self is the element
         elements, released, links, probes, retargets, callbacks, ops = [], [], [], [], [], {}, []
+        display_masks = {}
         pops = [0]
         requests = {}
         workers, dumps, other_states = [], [], []
@@ -642,20 +700,23 @@ class SharedTests(unittest.TestCase):
                                                 ELEMENT=8, STATE_CHANGED=16), debug_set_active=lambda *args: None,
                          init=lambda *args: None), 'os': NS(environ={}),
                      'threading': NS(Event=threading.Event, Lock=threading.Lock, Thread=Thread),
-                     'time': NS(monotonic=lambda: test.now), 'json': __import__('json'), 'contextlib': contextlib,
+                     'time': NS(monotonic=lambda: test.now, perf_counter=time.perf_counter),
+                     'json': __import__('json'), 'contextlib': contextlib,
                      'faulthandler': NS(dump_traceback=lambda **kwargs: dumps.append(kwargs)),
                      'RECOVERY_HUNG_AFTER': 30, 'RECOVERY_KICK_WAIT': 10, 'RECOVERY_JOIN_TIMEOUT': .2,
                      'configure_pgie': configure_pgie,
                      'make_element': Element, 'make_tracker': lambda: Element('nvtracker', 'vehicle-tracker'),
                      'create_preview_source_bin': lambda index, *args, **kwargs: (
                          ops.append(('create', index)) or Element('source', f'source-bin-{index}')),
-                     'build_output': lambda index, *args: Element('output', f'mjpeg-source-{index}')}
+                     'build_output': lambda index, *args, display_mask=False: (
+                         display_masks.__setitem__(index, display_mask) or Element('output', f'mjpeg-source-{index}'))}
         namespace.update(FrameTiming=FrameTiming, source_observer=lambda *args: lambda *args: None,
                          bus_observer=lambda *args: lambda *args: None,
                          InferenceDiagnostics=lambda: NS(), TRACKER_CONFIG='unused',
                          log_settings=lambda *args: None)
-        from vehicle_detection import add_vehicle_rois, prepare_vehicle_tracks
-        namespace.update(add_vehicle_rois=add_vehicle_rois, prepare_vehicle_tracks=prepare_vehicle_tracks)
+        from vehicle_detection import add_vehicle_rois, prepare_vehicle_tracks, attach_vehicle_masks, graft_status
+        namespace.update(add_vehicle_rois=add_vehicle_rois, prepare_vehicle_tracks=prepare_vehicle_tracks,
+                         attach_vehicle_masks=attach_vehicle_masks, graft_status=graft_status)
         namespace = load_preview({'run_shared_pipeline', 'CameraFrameSink'}, namespace)
         args = NS(cameras=list(manager.cameras_by_slot.values()), input=['private'] * count,
                   diagnostics=diagnostics, mux_live_source=1, rtsp_latency=1000, rtsp_drop_on_latency=False,
@@ -671,6 +732,11 @@ class SharedTests(unittest.TestCase):
             if vehicle_enabled:
                 args.vehicle_detector = NS(cameras=frozenset({'camera_0', 'camera_1'}), config_path=str(config),
                                            car_class_id=0, vehicle_class_ids=frozenset({0}))
+            if segmenter_enabled:
+                seg_config = Path(directory) / 'seg.txt'
+                seg_config.write_text(f'[property]\nmodel-engine-file={Path(directory) / "seg.engine"}\n')
+                args.vehicle_segmenter = NS(cameras=frozenset({'camera_0', 'camera_1'}), config_path=str(seg_config),
+                                            vehicle_class_ids=frozenset({0}), det_weights_sha256=None, box_width=1)
             error = namespace['run_shared_pipeline'](args, manager.metadata_store, manager.stores, manager, shutdown)
         self.assertIsNone(error)
         pipeline = next(e for e in elements if e.factory == 'pipeline')
@@ -685,7 +751,7 @@ class SharedTests(unittest.TestCase):
                 self.assertIn(('stream-demuxer', f'src_{index}'), probes)
         # PeopleNet is gone: the only nvinfer is the shared vehicle detector, if enabled.
         for factory in ('pipeline', 'nvstreammux', 'nvinfer', 'nvtracker', 'nvstreamdemux'):
-            expected = int(vehicle_enabled) if factory == 'nvinfer' else 1
+            expected = int(vehicle_enabled) * (1 + int(segmenter_enabled)) if factory == 'nvinfer' else 1
             self.assertEqual(sum(e.factory == factory for e in elements), expected)
         self.assertFalse(any(e.name == 'primary-inference' for e in elements))
         mux = next(e for e in elements if e.factory == 'nvstreammux')
@@ -698,7 +764,8 @@ class SharedTests(unittest.TestCase):
             self.assertIn(('vehicle-inference', 'sink'), probes)
             self.assertIn(('vehicle-inference', 'src'), probes)
             self.assertIn(('stream-muxer', 'src', 'vehicle-inference', 'sink'), links)
-            self.assertIn(('vehicle-inference', 'src', 'vehicle-tracker', 'sink'), links)
+            if not segmenter_enabled:
+                self.assertIn(('vehicle-inference', 'src', 'vehicle-tracker', 'sink'), links)
             self.assertIn(f'vehicle cameras=2 vehicle batch-size=2', captured.getvalue())
         else:
             self.assertIn(('stream-muxer', 'src', 'vehicle-tracker', 'sink'), links)
@@ -719,7 +786,7 @@ class SharedTests(unittest.TestCase):
         return {'elements': {e.name: e for e in elements}, 'captured': captured.getvalue(), 'manager': manager,
                 'retargets': retargets, 'pops': pops[0], 'callbacks': callbacks, 'ops': ops,
                 'released': released, 'all_elements': elements, 'probes': probes, 'workers': workers,
-                'dumps': dumps, 'other_states': other_states}
+                'dumps': dumps, 'other_states': other_states, 'links': links, 'display_masks': display_masks}
 
     def test_bus_source_error_and_eos_do_not_stop_shared_pipeline(self):
         tree = ast.parse((ROOT / 'preview.py').read_text())

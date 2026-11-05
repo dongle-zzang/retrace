@@ -17,6 +17,7 @@ web/hls/
 models/peoplenet/
 models/trafficcamnet/
 models/yolo11m/
+models/yolo11m-seg/
 *.onnx
 *.engine
 *.plan

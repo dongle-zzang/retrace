@@ -5,10 +5,14 @@ from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import patch
 
+import numpy as np
+
 from person_metadata import vehicle_from_object, FrameMetadata
 from preview_socket import detection_message
 from vehicle_detection import (prepare_vehicle_detector, add_vehicle_rois, prepare_vehicle_tracks,
-                               VehicleDetector, VEHICLE_TRACKER_CLASS)
+                               VehicleDetector, VEHICLE_TRACKER_CLASS,
+                               outline_from_grid, resample_mask, ring_mask, vehicle_outline,
+                               prepare_vehicle_segmenter, outline_box_width, graft_status, VehicleSegmenter)
 
 
 def nodes(values):
@@ -16,6 +20,293 @@ def nodes(values):
     for value in reversed(values):
         node = NS(data=value, next=node)
     return node
+
+
+def car_grid():
+    """50 x 75 cells: an oblique car body with a roof, like the design prototype."""
+    yy, xx = np.mgrid[0:50, 0:75]
+    car = (xx > 5 + yy * .3) & (xx < 60 + yy * .25) & (yy > 8) & (yy < 48)
+    return car | (((xx - 35) ** 2 / 400 + (yy - 14) ** 2 / 60) < 1)
+
+
+def signed_area(points):
+    # Shoelace in screen coordinates (y down): clockwise on screen is positive.
+    return sum(x1 * y2 - x2 * y1 for (x1, y1), (x2, y2) in zip(points, points[1:] + points[:1])) / 2
+
+
+def polygon_mask_iou(points, grid, rect):
+    left, top, width, height = rect
+    h, w = grid.shape
+    ys, xs = np.mgrid[0:h, 0:w]
+    px, py = left + (xs + .5) * width / w, top + (ys + .5) * height / h
+    inside = np.zeros_like(grid)
+    for (x1, y1), (x2, y2) in zip(points, points[1:] + points[:1]):
+        if y1 != y2:
+            inside ^= ((y1 > py) != (y2 > py)) & (px < (x2 - x1) * (py - y1) / (y2 - y1) + x1)
+    return (inside & grid).sum() / (inside | grid).sum()
+
+
+COCO8 = 'person\nbicycle\ncar\nmotorcycle\nairplane\nbus\ntrain\ntruck\n'
+# Generated detector config captured from the implementation before the seg refactor (2026-11-05).
+DETECTOR_GOLDEN = (
+    '[property]\nonnx-file=<root>/model.onnx\nlabelfile-path=<root>/labels.txt\ncustom-lib-path=<root>/parser.so\n'
+    'parse-bbox-func-name=NvDsInferParseYolo\nnum-detected-classes=8\nmaintain-aspect-ratio=1\ncluster-mode=2\n'
+    'gpu-id=0\nbatch-size=2\nprocess-mode=2\nnetwork-type=0\ngie-unique-id=2\noperate-on-gie-id=90\n'
+    'operate-on-class-ids=0\ninterval=0\nsecondary-reinfer-interval=0\nclassifier-async-mode=0\n'
+    'input-object-min-width=1\ninput-object-min-height=1\ninput-object-max-width=0\ninput-object-max-height=0\n'
+    'input-tensor-meta=0\nnetwork-mode=2\nfilter-out-class-ids=0;1;3;4;6\n'
+    'model-engine-file=<root>/vehicle/vehicle.engine\n\n[class-attrs-all]\npre-cluster-threshold=0.25\n\n'
+    '[class-attrs-2]\npre-cluster-threshold=0.25\n\n[class-attrs-5]\npre-cluster-threshold=0.25\n\n'
+    '[class-attrs-7]\npre-cluster-threshold=0.25\n\n')
+
+
+class SegmenterTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = root = Path(temporary.name)
+        (root / 'model.onnx').write_bytes(b'fake model')
+        (root / 'parser.so').write_bytes(b'parser')
+        (root / 'labels.txt').write_text(COCO8)
+        self.det_config = root / 'infer.txt'
+        self.det_config.write_text('[property]\nonnx-file=model.onnx\nlabelfile-path=labels.txt\ncustom-lib-path=parser.so\n'
+                                   'parse-bbox-func-name=NvDsInferParseYolo\nnum-detected-classes=8\n'
+                                   'maintain-aspect-ratio=1\ncluster-mode=2\n[class-attrs-all]\npre-cluster-threshold=0.25\n')
+        seg = root / 'seg'
+        seg.mkdir()
+        (seg / 'graft.onnx').write_bytes(b'fake seg model')
+        (seg / 'parser_seg.so').write_bytes(b'seg parser')
+        (seg / 'labels.txt').write_text(COCO8)
+        self.seg_config = seg / 'vehicle_seg_infer.txt'
+        self.seg_text = ('[property]\nonnx-file=graft.onnx\nlabelfile-path=labels.txt\ncustom-lib-path=parser_seg.so\n'
+                         'parse-bbox-instance-mask-func-name=NvDsInferParseYoloSeg\nnum-detected-classes=8\n'
+                         'network-type=3\ncluster-mode=4\noutput-instance-mask=1\nsegmentation-threshold=0.5\n'
+                         'process-mode=1\ngie-unique-id=1\n[class-attrs-all]\npre-cluster-threshold=0.1\n')
+        self.seg_config.write_text(self.seg_text)
+        self.targets = []
+        def cache(props, target):
+            self.targets.append(str(target))
+            props['model-engine-file'] = str(Path(target) / 'vehicle.engine')
+            return root, 'fixture'
+        patcher = patch('vehicle_detection.prepare_engine_cache', cache)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.env = {'VEHICLE_CAMERA_IDS': 'p1,p2', 'VEHICLE_INFER_CONFIG': str(self.det_config)}
+        self.detector = prepare_vehicle_detector([NS(camera_id='p1'), NS(camera_id='p2'), NS(camera_id='lobby')],
+                                                 root, self.env)
+
+    def segmenter(self, **env):
+        return prepare_vehicle_segmenter(self.detector, self.root,
+                                         {**self.env, 'VEHICLE_SEG_INFER_CONFIG': str(self.seg_config), **env})
+
+    def test_detector_generated_config_is_unchanged_by_refactor(self):
+        self.assertEqual(Path(self.detector.config_path).read_text().replace(str(self.root), '<root>'), DETECTOR_GOLDEN)
+
+    def test_segmenter_disabled_without_env(self):
+        self.assertIsNone(prepare_vehicle_segmenter(self.detector, self.root, self.env))
+        self.assertIsNone(prepare_vehicle_segmenter(self.detector, self.root, {**self.env, 'VEHICLE_SEG_INFER_CONFIG': ' '}))
+
+    def test_segmenter_forces_secondary_instance_segmentation_on_parking_roi(self):
+        seg = self.segmenter(VEHICLE_MIN_CONFIDENCE='0.3')
+        parser = configparser.ConfigParser()
+        parser.read(seg.config_path)
+        props = parser['property']
+        for key, value in {'process-mode': '2', 'network-type': '3', 'output-instance-mask': '1', 'cluster-mode': '4',
+                           'gie-unique-id': '3', 'operate-on-gie-id': '90', 'operate-on-class-ids': '0',
+                           'batch-size': '2', 'interval': '0', 'gpu-id': '0',
+                           'filter-out-class-ids': '0;1;3;4;6'}.items():
+            self.assertEqual(props[key], value, key)
+        self.assertEqual(props['custom-lib-path'], str(self.root / 'seg' / 'parser_seg.so'))
+        # Seg keeps its own low threshold; VEHICLE_MIN_CONFIDENCE belongs to the detector.
+        self.assertEqual(parser['class-attrs-7']['pre-cluster-threshold'], '0.1')
+        self.assertEqual(self.targets[-1], str(self.root / 'vehicle-seg'))
+        self.assertEqual(Path(seg.config_path).name, 'vehicle_seg_fixture.txt')
+        self.assertEqual((seg.cameras, seg.vehicle_class_ids, seg.box_width, seg.det_weights_sha256),
+                         (frozenset({'p1', 'p2'}), frozenset({2, 5, 7}), 1, None))
+        self.assertEqual(self.segmenter(VEHICLE_OUTLINE_BOX_WIDTH='0').box_width, 0)
+
+    def test_segmenter_reads_graft_manifest(self):
+        (self.root / 'seg' / 'manifest.json').write_text('{"det_weights_sha256": "%s"}' % ('a' * 64))
+        self.assertEqual(self.segmenter().det_weights_sha256, 'a' * 64)
+
+    def test_broken_segmenter_config_disables_outlines_without_raising(self):
+        for key in ('parse-bbox-instance-mask-func-name', 'custom-lib-path'):
+            self.seg_config.write_text('\n'.join(line for line in self.seg_text.splitlines()
+                                                 if not line.startswith(key)) + '\n')
+            with patch('builtins.print') as printed:
+                self.assertIsNone(self.segmenter())
+            self.assertEqual(printed.call_args.args[0], 'Vehicle segmentation unavailable; details hidden; outlines disabled')
+        self.seg_config.unlink()
+        with patch('builtins.print') as printed:
+            self.assertIsNone(self.segmenter())
+        self.assertNotIn(str(self.root), printed.call_args.args[0])
+
+    def test_outline_box_width(self):
+        for raw, expected in ((None, 1), ('0', 0), ('3', 3), (' 2 ', 2), ('4', 1), ('-1', 1), ('abc', 1), ('1.5', 1)):
+            with patch('builtins.print'):
+                self.assertEqual(outline_box_width({} if raw is None else {'VEHICLE_OUTLINE_BOX_WIDTH': raw}), expected)
+
+    def test_graft_status_compares_the_graft_with_the_active_detector_weights(self):
+        seg = VehicleSegmenter(frozenset({'p1'}), 'unused', frozenset({2}), det_weights_sha256='a' * 64)
+        active = self.root / 'active'
+        active.mkdir()
+        config = active / 'infer.txt'
+        self.assertIsNone(graft_status(None, config))
+        self.assertEqual(graft_status(seg, config), 'unknown')  # original model: no manifest beside its config
+        (active / 'manifest.json').write_text('{"weights_sha256": "%s"}' % ('a' * 64))
+        self.assertEqual(graft_status(seg, config), 'match')
+        (active / 'manifest.json').write_text('{"weights_sha256": "%s"}' % ('b' * 64))
+        self.assertEqual(graft_status(seg, config), 'stale')
+        self.assertEqual(graft_status(VehicleSegmenter(frozenset({'p1'}), 'unused', frozenset({2})), config), 'unknown')
+        (active / 'manifest.json').write_text('not json')
+        self.assertEqual(graft_status(seg, config), 'unknown')
+
+
+class FakeMask:
+    """NvOSD_MaskParams: get_mask_array is a flat float view, alloc_mask_array allocates width*height floats."""
+    def __init__(self, width=0, height=0, data=None, threshold=.5):
+        self.width, self.height, self.threshold, self.data = width, height, threshold, data
+        self.size = 0 if data is None else data.nbytes
+        self.allocated = None
+
+    def get_mask_array(self):
+        return self.data
+
+    def alloc_mask_array(self):
+        self.size = self.width * self.height * 4
+        self.allocated = np.zeros(self.width * self.height, np.float32)
+        return self.allocated
+
+
+def box(component, left, top, width, height, class_id=2, mask=None):
+    return NS(unique_component_id=component, class_id=class_id, parent=None, mask_params=mask or FakeMask(),
+              rect_params=NS(left=left, top=top, width=width, height=height))
+
+
+def det(left, top, width=300, height=200, class_id=2):
+    return box(2, left, top, width, height, class_id)
+
+
+def seg(left, top, width=300, height=200, fill=1.0, class_id=2):
+    data = np.zeros((160, 160), np.float32)
+    data[:round(160 * fill)] = .9
+    return box(3, left, top, width, height, class_id, FakeMask(160, 160, data.ravel()))
+
+
+PYDS = NS(NvDsFrameMeta=NS(cast=lambda v: v), NvDsObjectMeta=NS(cast=lambda v: v))
+PARKING_DETECTOR = VehicleDetector(frozenset({'parking'}), 'unused', 2, frozenset({2, 5, 7}))
+PARKING_SEGMENTER = VehicleSegmenter(frozenset({'parking'}), 'unused', frozenset({2, 5, 7}))
+
+
+def batch_with(**frames):
+    return NS(frame_meta_list=nodes([NS(camera_id=camera, obj_meta_list=nodes(objects))
+                                     for camera, objects in frames.items()]))
+
+
+def attach(batch):
+    from vehicle_detection import attach_vehicle_masks
+    return attach_vehicle_masks(batch, PARKING_DETECTOR, PARKING_SEGMENTER, lambda frame: frame, PYDS)
+
+
+class MaskAttachTests(unittest.TestCase):
+    def test_masks_attach_to_the_best_iou_det_one_to_one_as_a_ring(self):
+        det_a, det_b = det(800, 500), det(1200, 600)
+        exact, shifted, far = seg(800, 500), seg(830, 500), seg(100, 100, 50, 50)
+        self.assertEqual(attach(batch_with(parking=[det_a, det_b, shifted, exact, far])), 0)
+        mask = det_a.mask_params
+        self.assertEqual((mask.width, mask.height, mask.threshold), (75, 50, .5))
+        grid = mask.allocated.reshape(50, 75)
+        self.assertTrue(grid[0].all())  # the exact seg won: the shifted one leaves the left cells empty
+        self.assertFalse(grid[25, 30])  # ring: interior removed
+        self.assertIsNone(det_b.mask_params.allocated)  # nothing overlaps it by IoU >= 0.5
+        for unused in (shifted, far):
+            self.assertIsNone(unused.mask_params.allocated)
+
+    def test_low_fill_masks_and_non_parking_frames_get_no_mask(self):
+        sparse_det, lobby_det = det(800, 500), det(0, 0)
+        attach(batch_with(parking=[sparse_det, seg(800, 500, fill=.1)], lobby=[lobby_det, seg(0, 0)]))
+        self.assertIsNone(sparse_det.mask_params.allocated)
+        self.assertIsNone(lobby_det.mask_params.allocated)
+
+    def test_broken_pair_is_skipped_and_other_pairs_still_attach(self):
+        broken = seg(800, 500)
+        broken.mask_params.width = 7  # size != width * height from a broken parser
+        good_det = det(1200, 600)
+        self.assertEqual(attach(batch_with(parking=[det(800, 500), broken, good_det, seg(1200, 600)])), 1)
+        self.assertIsNotNone(good_det.mask_params.allocated)
+
+    def test_seg_only_frames_and_wrong_classes_attach_nothing(self):
+        person = det(800, 500, class_id=0)
+        self.assertEqual(attach(batch_with(parking=[person, seg(800, 500), seg(0, 0, class_id=0)])), 0)
+        self.assertIsNone(person.mask_params.allocated)
+
+    def test_prepare_removes_seg_objects_and_returns_the_roi_parent_last(self):
+        roi = NS(unique_component_id=90, class_id=0)
+        car, seg_car = det(800, 500), seg(800, 500)
+        car.parent = seg_car.parent = roi
+        seg_only = seg(0, 0)
+        removed = []
+        pyds = NS(NvDsFrameMeta=NS(cast=lambda v: v), NvDsObjectMeta=NS(cast=lambda v: v),
+                  nvds_remove_obj_meta_from_frame=lambda frame, obj: removed.append(obj))
+        prepare_vehicle_tracks(batch_with(parking=[roi, car, seg_car], other=[seg_only]),
+                               VehicleDetector(frozenset({'parking'}), 'unused', 2, frozenset({2})), lambda f: f, pyds)
+        self.assertEqual(removed, [seg_car, roi, seg_only])
+        self.assertIsNone(car.parent)
+        self.assertEqual(car.class_id, VEHICLE_TRACKER_CLASS)
+
+
+class OutlineTests(unittest.TestCase):
+    def test_outline_follows_mask_within_box(self):
+        grid, rect = car_grid(), (800.0, 500.0, 300.0, 200.0)
+        points = outline_from_grid(grid, *rect)
+        self.assertGreaterEqual(len(points), 3)
+        self.assertLessEqual(len(points), 32)
+        self.assertNotEqual(points[0], points[-1])
+        self.assertTrue(all(800 <= x <= 1100 and 500 <= y <= 700 for x, y in points))
+        self.assertTrue(all(round(value, 1) == value for point in points for value in point))
+        self.assertGreater(signed_area(list(points)), 0)
+        self.assertGreaterEqual(polygon_mask_iou(list(points), grid, rect), .9)
+
+    def test_ring_outline_equals_filled_outline(self):
+        self.assertEqual(outline_from_grid(ring_mask(car_grid()), 0, 0, 300, 200),
+                         outline_from_grid(car_grid(), 0, 0, 300, 200))
+        ring = ring_mask(car_grid())
+        self.assertTrue(ring[car_grid()].any())
+        self.assertFalse(ring[25, 30])  # interior removed, the border stays
+
+    def test_empty_single_row_and_tiny_masks_have_no_outline(self):
+        self.assertIsNone(outline_from_grid(np.zeros((5, 5), bool), 0, 0, 20, 20))
+        one = np.zeros((5, 5), bool)
+        one[2, 1:4] = True
+        self.assertIsNone(outline_from_grid(one, 0, 0, 20, 20))
+        tiny = resample_mask(np.ones((160, 160), bool), (0, 0, 3, 3), (0, 0, 3, 3))
+        self.assertEqual(tiny.shape, (1, 1))
+        self.assertIsNone(outline_from_grid(tiny, 0, 0, 3, 3))
+
+    def test_resample_maps_cells_and_leaves_outside_seg_box_empty(self):
+        seg = np.ones((160, 160), bool)
+        # The det box is wider than the seg box, like a vehicle cut at the frame edge.
+        grid = resample_mask(seg, (100.0, 100.0, 40.0, 40.0), (80.0, 100.0, 80.0, 40.0))
+        self.assertEqual(grid.shape, (10, 20))
+        self.assertFalse(grid[:, :5].any())
+        self.assertFalse(grid[:, 15:].any())
+        self.assertTrue(grid[:, 5:15].all())
+        half = np.zeros((160, 160), bool)
+        half[:, :80] = True
+        grid = resample_mask(half, (0.0, 0.0, 400.0, 200.0), (0.0, 0.0, 400.0, 200.0))
+        self.assertEqual(grid.shape, (50, 100))
+        self.assertTrue(grid[:, :50].all())
+        self.assertFalse(grid[:, 50:].any())
+
+    def test_vehicle_outline_reads_mask_params_and_never_raises(self):
+        data = car_grid().astype(np.float32).ravel()
+        obj = NS(mask_params=NS(size=data.nbytes, width=75, height=50, threshold=.5, get_mask_array=lambda: data),
+                 rect_params=NS(left=800.0, top=500.0, width=300.0, height=200.0))
+        self.assertEqual(vehicle_outline(obj), outline_from_grid(car_grid(), 800.0, 500.0, 300.0, 200.0))
+        obj.mask_params.width = 74  # size mismatch from a broken parser
+        self.assertIsNone(vehicle_outline(obj))
+        obj.mask_params.size = 0
+        self.assertIsNone(vehicle_outline(obj))
 
 
 class VehicleTests(unittest.TestCase):
@@ -145,6 +436,16 @@ class VehicleTests(unittest.TestCase):
         self.assertIn(allocated[0], removed)
         self.assertIn(wrong, removed)
         self.assertNotIn(person, removed)
+
+    def test_detached_vehicle_serializes_outline_as_point_arrays_or_null(self):
+        import json
+        obj = NS(object_id=7, class_id=100, confidence=.9, tracker_confidence=.7,
+                 rect_params=NS(left=192, top=108, width=384, height=216))
+        outline = ((1.0, 2.0), (3.0, 4.0), (5.0, 6.5))
+        vehicle = vehicle_from_object('parking', '2026-01-01T00:00:00Z', obj, 2, outline=outline)
+        frame = FrameMetadata(0, 'parking', 1, vehicle.timestamp, None, True, (), vehicles=(vehicle,)).to_dict()
+        self.assertEqual(json.loads(json.dumps(frame))['vehicles'][0]['outline'], [[1.0, 2.0], [3.0, 4.0], [5.0, 6.5]])
+        self.assertIsNone(vehicle_from_object('parking', '2026-01-01T00:00:00Z', obj, 2).to_dict()['outline'])
 
     def test_detached_metadata_retains_native_class_and_lossless_id(self):
         obj = NS(object_id=(1 << 63) + 3, class_id=100, confidence=.9, tracker_confidence=.7,

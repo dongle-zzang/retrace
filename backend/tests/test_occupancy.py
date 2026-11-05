@@ -242,6 +242,30 @@ def test_polling_db_events_live_vehicles_and_unknown_failure(service, monkeypatc
     assert client.get("/api/cameras/first/vehicles").json()["vehicles"] == []
 
 
+def test_vehicles_api_passes_outline_and_one_bad_outline_never_drops_the_frame(service):
+    client, app, upstream, _, _ = service
+    square = [[100.0, 200.0], [400.0, 200.0], [400.0, 500.0], [100.0, 500.0]]
+    bad = [[[1, 2]] * 33, [[1, 2], [3, 4]], "bad", [[1, 2, 3], [4, 5, 6], [7, 8, 9]], [[1, 2], [3, "x"], [5, 6]],
+           [[1, 2], [True, False], [5, 6]], None]
+    vehicles = [vehicle(track=1) | {"outline": square}, vehicle(track=2)]
+    vehicles += [vehicle(track=3 + i) | {"outline": value} for i, value in enumerate(bad)]
+    upstream["metadata"]["frames"] = [{**frame(), "persons": [], "vehicles": vehicles,
+                                       "vehicle_detection_enabled": True, "vehicle_inference_done": True}]
+    app.state.poller.poll_once()
+    body = client.get("/api/cameras/first/vehicles").json()["vehicles"]
+    assert [v["track_id"] for v in body] == [str(i) for i in range(1, 3 + len(bad))]
+    assert [v["outline"] for v in body] == [square] + [None] * (1 + len(bad))
+    assert body[0]["bbox"] == vehicle()["bbox"]
+
+
+def test_vehicle_outline_with_non_finite_points_is_null():
+    from backend.app.schemas import VehicleIn
+    for value in (float("nan"), float("inf")):
+        assert VehicleIn.model_validate(vehicle() | {"outline": [[1, 2], [3, value], [5, 6]]}).outline is None
+    assert VehicleIn.model_validate(vehicle() | {"outline": ((1, 2), (3, 4), (5, 6.5))}).outline == [
+        (1.0, 2.0), (3.0, 4.0), (5.0, 6.5)]
+
+
 def test_current_api_expires_without_poller_and_geometry_edit_event(service, monkeypatch):
     client, app, upstream, _, _ = service
     space = create(client, polygon=POLYGON).json()

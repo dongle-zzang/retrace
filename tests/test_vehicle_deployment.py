@@ -89,13 +89,13 @@ class ControllerTests(unittest.TestCase):
             for i, c in enumerate(self.fps)})
         self.frame = 0
 
-    def controller(self, element=None, prepare=None):
+    def controller(self, element=None, prepare=None, segmenter=None):
         self.element = element or FakeElement()
         self.configured = []
         return vd.DeploymentController(self.element, self.detector, self.manager, self.directory,
                                        clock=lambda: self.now[0], wall=lambda: self.wall[0],
                                        configure=lambda e, path, batch: self.configured.append((path, batch)),
-                                       prepare=prepare)
+                                       prepare=prepare, segmenter=segmenter)
 
     def advance(self, controller, seconds, detections=1, step=1.0, cameras=('p1', 'p2'), inferred=None):
         """Each camera delivers frames at its FPS; inferred overrides the inferred frames per step."""
@@ -562,6 +562,19 @@ class ControllerTests(unittest.TestCase):
         with patch.object(broken, 'rollback', side_effect=OSError):
             broken.fault()
         self.assertEqual(broken.state['phase'], 'rollback_failed')
+
+    def test_segmentation_graft_follows_the_active_detector_weights(self):
+        public = lambda: vd.public_status(self.directory, lambda: self.wall[0])
+        self.controller()
+        self.assertIsNone(public()['segmentation_graft'])  # segmentation off
+        controller = self.controller(segmenter=NS(det_weights_sha256='a' * 64))
+        self.assertEqual(public()['segmentation_graft'], 'unknown')  # original model has no weights manifest
+        self.deploy(controller, weights_sha256='a' * 64)
+        self.advance(controller, VERIFY)
+        self.assertEqual((controller.state['phase'], public()['segmentation_graft']), ('completed', 'match'))
+        self.deploy(controller, model='m2', job='22222222-2222-4222-8222-222222222222', weights_sha256='b' * 64)
+        self.advance(controller, VERIFY)
+        self.assertEqual((controller.state['phase'], public()['segmentation_graft']), ('completed', 'stale'))
 
     def test_observe_batch_counts_only_selected_vehicle_detections(self):
         controller = self.controller()
