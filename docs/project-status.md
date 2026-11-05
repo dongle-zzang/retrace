@@ -217,7 +217,7 @@
 | --- | --- |
 | 백엔드 `PermissionError`로 크래시 루프가 생기고 502 발생 | `chmod -R a+rX backend/app camera_config.py` 실행 후 재빌드. `frontend-dist`와 `training`도 같은 조치가 필요합니다. |
 | evaluate 작업에서 `KeyError 'epochs'` | 예전 워커가 떠 있는 상태이므로 워커를 재시작합니다. |
-| 카메라는 정상인데 웹에서 일부만 "No video from camera (offline)" | 앱이 자동 복구합니다(`source_reset` → 120초 뒤 `source_rebuild` 로그, `/streams.json`의 `recovery_count`). `recovery_count`만 늘고 online이 안 되면 `docker compose logs -t retrace \| grep -E 'source_re\|WARNING factory='`를 수집한 뒤 `docker compose restart retrace`. |
+| 카메라는 정상인데 웹에서 일부만 "No video from camera (offline)" | 앱이 자동 복구합니다(`source_reset` → 120초 뒤 `source_rebuild` 로그, `/streams.json`의 `recovery_count`). `recovery_count`만 늘고 online이 안 되면 `docker compose logs -t retrace \| grep -E 'source_re\|WARNING factory='`를 수집한 뒤 `docker compose restart retrace`. 먼저 루프 생존을 확인합니다: `docker compose logs -t --since=1m retrace \| grep -c camera_status`가 252 전후가 아니면(0) 제어 루프 정지이므로 `docker compose kill -s SIGUSR1 retrace`로 스택을 남기고 재시작. `source_recovery_abandoned`가 있으면 그 카메라는 재시작 전까지 자동 복구되지 않습니다. |
 | `/api/training/auth`가 415 반환 | `{}` 본문과 `Content-Type: application/json`을 함께 보냅니다. |
 
 ---

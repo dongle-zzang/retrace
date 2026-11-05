@@ -255,6 +255,15 @@ class SharedTests(unittest.TestCase):
         manager.recovered(0)
         self.assertEqual([manager.recovery_mode(slot) for slot in (0, 1)], ['rebuild', 'reset'])
 
+    def test_abandoned_slot_gets_only_ordinary_retries(self):
+        manager = self.manager()
+        self.silence(manager, 0)
+        self.now += 5
+        manager.abandon_recovery(0)
+        self.assertEqual(manager.tick(), [])
+        status = manager.runtimes[0].snapshot()
+        self.assertEqual((status.state, status.generation, status.recovery_count), ('reconnecting', 3, 0))
+
     def test_tick_without_recovery_keeps_observation_only_retries(self):
         manager = self.manager(recovery_enabled=False)
         self.silence(manager, 0)
@@ -324,6 +333,9 @@ class SharedTests(unittest.TestCase):
         run = self.construct(2, reset={'slot': 0, 'ticks': 2})
         source, other = run['elements']['source-bin-0'], run['elements']['source-bin-1']
         self.assertEqual((source.states, source.synced, other.states, other.synced), (['NULL'], 1, [], 0))
+        self.assertEqual(self.rebuild_ops(run), [  # flush_stop: a kicked (flushing) mux pad must accept the reset stream
+            ('set_state', 'source-bin-0', 'NULL'), ('event', 'stream-muxer', 'sink_0', ('flush_stop', False)),
+            ('sync', 'source-bin-0')])
         self.assertEqual(run['retargets'], [])  # the plugin kept its pad, so the ghost link stays
         status = run['manager'].runtimes[0].snapshot()
         self.assertEqual((status.state, status.generation, status.recovery_count), ('reconnecting', 3, 1))
@@ -364,7 +376,8 @@ class SharedTests(unittest.TestCase):
         self.assertEqual(len(bins), 2)  # startup bin, rebuilt bin
         old, new = bins
         self.assertEqual(self.rebuild_ops(run), [
-            ('set_state', 'source-bin-0', 'NULL'), ('sync', 'source-bin-0'),  # recovery 1: in-place reset
+            ('set_state', 'source-bin-0', 'NULL'), ('event', 'stream-muxer', 'sink_0', ('flush_stop', False)),
+            ('sync', 'source-bin-0'),  # recovery 1: in-place reset
             ('set_state', 'source-bin-0', 'NULL'),  # recovery 2: rebuild
             ('event', 'stream-muxer', 'sink_0', ('flush_stop', False)),
             ('unlink', 'source-bin-0', 'stream-muxer', 'sink_0'),
@@ -391,7 +404,7 @@ class SharedTests(unittest.TestCase):
     def test_control_loop_retries_rebuild_from_creation_after_a_request_failure(self):
         # The second sink_0 request (first rebuild) fails; the next rebuild 600 s later starts at creation.
         run = self.construct(2, reset={'slot': 0, 'ticks': 170, 'step': 5, 'decoded_first': True, 'fail_request': ('sink_0', 2)})
-        ops = self.rebuild_ops(run, start=2)
+        ops = self.rebuild_ops(run, start=3)
         self.assertEqual(ops[:9], [
             ('set_state', 'source-bin-0', 'NULL'), ('event', 'stream-muxer', 'sink_0', ('flush_stop', False)),
             ('unlink', 'source-bin-0', 'stream-muxer', 'sink_0'), ('release', 'stream-muxer', 'sink_0'),
@@ -410,7 +423,7 @@ class SharedTests(unittest.TestCase):
     def test_control_loop_gives_up_a_rebuild_whose_bin_never_reaches_null(self):
         run = self.construct(2, reset={'slot': 0, 'ticks': 36, 'step': 5, 'decoded_first': True, 'result': 'ASYNC',
                                        'get_state': ('ASYNC', 'READY', 'NULL')})
-        self.assertEqual(self.rebuild_ops(run)[2:], [('set_state', 'source-bin-0', 'NULL'),
+        self.assertEqual(self.rebuild_ops(run)[3:], [('set_state', 'source-bin-0', 'NULL'),
                                                      ('get_state', 'source-bin-0', 5000)])
         self.assertIn('source_rebuild_failed {"camera_id":"camera_0","source_id":0,"stage":"null"}',
                       run['captured'].splitlines())
@@ -419,7 +432,7 @@ class SharedTests(unittest.TestCase):
     def test_control_loop_survives_an_exception_inside_a_rebuild(self):
         run = self.construct(2, reset={'slot': 0, 'ticks': 36, 'step': 5, 'decoded_first': True, 'raise_release': True})
         self.assertEqual(run['pops'], 36)  # the loop kept polling after the failed rebuild
-        self.assertEqual(self.rebuild_ops(run)[2:], [
+        self.assertEqual(self.rebuild_ops(run)[3:], [
             ('set_state', 'source-bin-0', 'NULL'), ('event', 'stream-muxer', 'sink_0', ('flush_stop', False)),
             ('unlink', 'source-bin-0', 'stream-muxer', 'sink_0'), ('release', 'stream-muxer', 'sink_0')])
         lines = run['captured'].splitlines()
@@ -433,10 +446,60 @@ class SharedTests(unittest.TestCase):
 
     def test_control_loop_keeps_resetting_in_place_when_rebuild_is_disabled(self):
         run = self.construct(2, reset={'slot': 0, 'ticks': 36, 'step': 5, 'decoded_first': True}, rebuild_enabled=False)
-        self.assertEqual(self.rebuild_ops(run), [('set_state', 'source-bin-0', 'NULL'), ('sync', 'source-bin-0')] * 2)
+        self.assertEqual(self.rebuild_ops(run), [('set_state', 'source-bin-0', 'NULL'),
+                                                 ('event', 'stream-muxer', 'sink_0', ('flush_stop', False)),
+                                                 ('sync', 'source-bin-0')] * 2)
         self.assertEqual(run['manager'].recovery_mode(0), 'rebuild')
         self.assertEqual(sum(l.startswith('source_reset ') for l in run['captured'].splitlines()), 2)
         self.assertNotIn('source_rebuild', run['captured'])
+
+    def test_recovery_watchdog_constants_match_the_design(self):
+        tree = ast.parse((ROOT / 'preview.py').read_text())
+        values = {n.targets[0].id: ast.literal_eval(n.value) for n in tree.body
+                  if isinstance(n, ast.Assign) and getattr(n.targets[0], 'id', '').startswith('RECOVERY_')}
+        self.assertEqual(values, {'RECOVERY_HUNG_AFTER': 30, 'RECOVERY_KICK_WAIT': 10, 'RECOVERY_JOIN_TIMEOUT': 5})
+
+    def test_hung_reset_is_kicked_and_resumes_while_other_cameras_keep_updating(self):
+        # 5 s per tick: reset starts at tick 1 and hangs in NULL; hung at +30 s (tick 7), released at tick 8.
+        run = self.construct(2, reset={'slot': 0, 'ticks': 10, 'step': 5, 'hang': 8, 'other_stops_at': 2})
+        self.assertEqual(self.rebuild_ops(run), [
+            ('set_state', 'source-bin-0', 'NULL'),
+            ('event', 'stream-muxer', 'sink_0', ('flush_start',)),  # kick from the control loop
+            ('event', 'stream-muxer', 'sink_0', ('flush_stop', False)), ('sync', 'source-bin-0')])
+        self.assertEqual(run['dumps'], [{'all_threads': True}])
+        lines = run['captured'].splitlines()
+        recovery = [l for l in lines if l.startswith('source_')]
+        self.assertEqual(recovery, [
+            'source_recovery_hung {"camera_id":"camera_0","source_id":0,"mode":"reset","seconds":30.0}',
+            'source_reset {"camera_id":"camera_0","source_id":0,"generation":3,"recovery_count":1}',
+            'source_recovery_unblocked {"camera_id":"camera_0","source_id":0,"mode":"reset","seconds":35.0}'])
+        self.assertIn('offline', run['other_states'][:6])  # the other camera went offline while the reset hung
+        self.assertEqual(run['pops'], 10)
+        self.assertEqual(len(run['workers']), 1)
+
+    def test_abandoned_reset_leaves_the_slot_to_ordinary_retries_and_frees_other_recoveries(self):
+        run = self.construct(2, reset={'slot': 0, 'ticks': 45, 'step': 5, 'hang': None, 'other_stops_at': 2})
+        lines = [l for l in run['captured'].splitlines() if l.startswith('source_')]
+        self.assertEqual(lines[:2], [
+            'source_recovery_hung {"camera_id":"camera_0","source_id":0,"mode":"reset","seconds":30.0}',
+            'source_recovery_abandoned {"camera_id":"camera_0","source_id":0,"mode":"reset","seconds":40.0}'])
+        self.assertTrue(lines[2].startswith('source_reset {"camera_id":"camera_1","source_id":1,'))
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(run['elements']['source-bin-0'].states, ['NULL'])  # never recovered again
+        status = run['manager'].runtimes[0].snapshot()
+        self.assertEqual(status.recovery_count, 0)
+        self.assertGreater(status.generation, 3)  # ordinary observation attempts went on
+        self.assertEqual(run['manager'].runtimes[1].snapshot().recovery_count, 1)
+        self.assertTrue(run['workers'][0].is_alive())  # still stuck; abandoned, not joined
+        self.assertEqual(run['pops'], 45)
+        self.assertNotIn('private', run['captured'])
+
+    def test_shutdown_waits_only_briefly_for_a_hung_recovery(self):
+        run = self.construct(2, reset={'slot': 0, 'ticks': 8, 'step': 5, 'hang': None})
+        self.assertIn('source_recovery_hung', run['captured'])
+        self.assertNotIn('source_recovery_abandoned', run['captured'])
+        self.assertTrue(run['workers'][0].is_alive())
+        self.assertEqual(run['elements']['preview-detection'].states, ['PLAYING', 'NULL'])
 
     def construct(self, count, diagnostics=False, vehicle_enabled=False, reset=None, rebuild_enabled=True):
         manager = self.manager(count)
@@ -444,7 +507,29 @@ class SharedTests(unittest.TestCase):
         elements, released, links, probes, retargets, callbacks, ops = [], [], [], [], [], {}, []
         pops = [0]
         requests = {}
+        workers, dumps, other_states = [], [], []
         shutdown = threading.Event()
+        hang = None
+        if reset is not None and 'hang' in reset:
+            # source-bin-0's first NULL blocks until pop `hang` (None: never), like a stuck native call.
+            hang = {'entered': threading.Event(), 'release': threading.Event(), 'release_at': reset['hang']}
+
+            def release_hung_worker():
+                hang['release'].set()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    settle()
+            self.addCleanup(release_hung_worker)
+
+        class Thread(threading.Thread):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                workers.append(self)
+
+        def settle():
+            """Recovery workers finish before test time moves on, except one parked in a hung NULL."""
+            for worker in workers:
+                while worker.is_alive() and not (hang and hang['entered'].is_set() and not hang['release'].is_set()):
+                    worker.join(.01)
         if reset is None:
             shutdown.set()
         else:
@@ -516,12 +601,17 @@ class SharedTests(unittest.TestCase):
             def get_bus(self):
                 def timed_pop_filtered(*args):
                     pops[0] += 1
+                    if hang and pops[0] == hang['release_at']:
+                        hang['release'].set()
+                    settle()
                     if reset is not None and reset.get('step'):
                         # Time passes between ticks; the healthy camera keeps decoding.
                         test.now = round(test.now + reset['step'], 1)
-                        pts = int(test.now * 1000)
-                        manager.observe_decoded(other, pts)
-                        manager.publish(other, pts, lambda: None, output=True)
+                        if pops[0] < reset.get('other_stops_at', float('inf')):
+                            pts = int(test.now * 1000)
+                            manager.observe_decoded(other, pts)
+                            manager.publish(other, pts, lambda: None, output=True)
+                        other_states.append(manager.runtimes[other].snapshot().state)
                     if reset is not None and pops[0] >= reset['ticks']:
                         shutdown.set()
                     return None
@@ -530,6 +620,9 @@ class SharedTests(unittest.TestCase):
                 self.states.append(state)
                 ops.append(('set_state', self.name, state))
                 if self.factory == 'source' and reset is not None:
+                    if hang and self.name == 'source-bin-0' and state == 'NULL' and not hang['entered'].is_set():
+                        hang['entered'].set()
+                        hang['release'].wait(10)
                     return reset.get('result', 'SUCCESS')
                 return 'SUCCESS'
             synced = 0
@@ -542,12 +635,16 @@ class SharedTests(unittest.TestCase):
                          Caps=NS(from_string=lambda caps: caps), PadProbeType=NS(BUFFER=1, EVENT_DOWNSTREAM=2),
                          PadLinkReturn=NS(OK='OK'), State=NS(PLAYING='PLAYING', NULL='NULL'), MSECOND=1,
                          EventType=NS(EOS='EOS'), PadProbeReturn=NS(OK='OK', DROP='DROP'), SECOND=1000,
-                         Event=NS(new_flush_stop=lambda reset_time: ('flush_stop', reset_time)),
+                         Event=NS(new_flush_stop=lambda reset_time: ('flush_stop', reset_time),
+                                  new_flush_start=lambda: ('flush_start',)),
                          StateChangeReturn=NS(FAILURE='FAILURE', ASYNC='ASYNC', SUCCESS='SUCCESS'),
                          MessageType=NS(ERROR=1, WARNING=2, EOS=4,
                                                 ELEMENT=8, STATE_CHANGED=16), debug_set_active=lambda *args: None,
-                         init=lambda *args: None), 'os': NS(environ={}), 'threading': threading,
-                     'time': __import__('time'), 'json': __import__('json'),
+                         init=lambda *args: None), 'os': NS(environ={}),
+                     'threading': NS(Event=threading.Event, Lock=threading.Lock, Thread=Thread),
+                     'time': NS(monotonic=lambda: test.now), 'json': __import__('json'), 'contextlib': contextlib,
+                     'faulthandler': NS(dump_traceback=lambda **kwargs: dumps.append(kwargs)),
+                     'RECOVERY_HUNG_AFTER': 30, 'RECOVERY_KICK_WAIT': 10, 'RECOVERY_JOIN_TIMEOUT': .2,
                      'configure_pgie': configure_pgie,
                      'make_element': Element, 'make_tracker': lambda: Element('nvtracker', 'vehicle-tracker'),
                      'create_preview_source_bin': lambda index, *args, **kwargs: (
@@ -621,7 +718,8 @@ class SharedTests(unittest.TestCase):
         self.assertNotIn('private', captured.getvalue())
         return {'elements': {e.name: e for e in elements}, 'captured': captured.getvalue(), 'manager': manager,
                 'retargets': retargets, 'pops': pops[0], 'callbacks': callbacks, 'ops': ops,
-                'released': released, 'all_elements': elements, 'probes': probes}
+                'released': released, 'all_elements': elements, 'probes': probes, 'workers': workers,
+                'dumps': dumps, 'other_states': other_states}
 
     def test_bus_source_error_and_eos_do_not_stop_shared_pipeline(self):
         tree = ast.parse((ROOT / 'preview.py').read_text())

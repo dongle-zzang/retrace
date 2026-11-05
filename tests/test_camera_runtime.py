@@ -291,6 +291,22 @@ class RecoveryPolicyTests(unittest.TestCase):
         self.frameless_attempt(2)
         self.assertEqual(self.runtime.recovery_mode(), 'rebuild')
 
+    def test_abandoned_recovery_is_not_due_until_the_hung_recovery_reports_back(self):
+        self.silence_after_frames()
+        self.runtime.abandon_recovery()
+        self.assertFalse(self.runtime.recovery_due())
+        self.now += 3600
+        self.assertFalse(self.runtime.recovery_due())
+        self.runtime.recovery_failed()  # the hung worker finally returned
+        self.now += 120
+        self.assertTrue(self.runtime.recovery_due())
+        self.runtime.abandon_recovery()
+        self.runtime.begin_recovery()
+        self.now += 30
+        self.assertEqual(self.runtime.check_health(), 'no_frames')
+        self.now += 300
+        self.assertTrue(self.runtime.recovery_due())
+
     def test_status_serializes_recovery_count_without_secrets(self):
         generation = self.runtime.begin_attempt()
         self.runtime.fail('rtsp://private-secret@camera.example/video', generation)

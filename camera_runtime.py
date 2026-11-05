@@ -70,6 +70,7 @@ class CameraRuntime:
         self._frameless_attempts = 0
         self._recoveries = 0
         self._recovery_not_before = self._started
+        self._recovery_abandoned = False
 
     def begin_attempt(self, watchdog=True):
         with self._lock:
@@ -205,7 +206,7 @@ class CameraRuntime:
     def recovery_due(self):
         """Two consecutive attempts without a single frame and the spacing has elapsed."""
         with self._lock:
-            return (not self._running and self._frameless_attempts >= 2
+            return (not self._running and not self._recovery_abandoned and self._frameless_attempts >= 2
                     and self.clock() >= self._recovery_not_before)
 
     def recovery_mode(self):
@@ -214,7 +215,13 @@ class CameraRuntime:
             # shortcut: 첫 caps부터 거부된 스트림은 재생성하지 않음, 재시작 후에도 안 뜨는 카메라가 계속 멈춰 있으면 재검토
             return 'reset' if self._recoveries == 0 or self._ever_frame is None else 'rebuild'
 
+    def abandon_recovery(self):
+        """A recovery hung in native code: stop recovering until that worker reports back."""
+        with self._lock:
+            self._recovery_abandoned = True
+
     def _defer_recovery(self):
+        self._recovery_abandoned = False
         self._recoveries += 1
         self._recovery_not_before = self.clock() + RECOVERY_BACKOFF[min(self._recoveries - 1, len(RECOVERY_BACKOFF) - 1)]
 
@@ -322,6 +329,9 @@ class CameraRuntimeManager:
 
     def recovery_failed(self, slot):
         self.runtimes[self.cameras_by_slot[slot].source_id].recovery_failed()
+
+    def abandon_recovery(self, slot):
+        self.runtimes[self.cameras_by_slot[slot].source_id].abandon_recovery()
 
     def observe_decoded(self, slot, pts):
         with self._lock:

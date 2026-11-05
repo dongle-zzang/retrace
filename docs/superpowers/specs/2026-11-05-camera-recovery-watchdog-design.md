@@ -1,6 +1,18 @@
 # 카메라 복구 감시(watchdog) 설계 (2026-11-05)
 
-상태: 설계 승인됨, 구현 대기. 구현과 GPU 검증은 서버 체크아웃에서 수행한다.
+상태: 구현됨 (2026-11-05). CPU 테스트 통과, 배포와 GPU 검증(§6)은 대기.
+
+구현 메모(설계와 다른 점):
+
+- §4-2 작업 스레드가 끝났거나 포기한 tick에는 새 복구를 시작하지 않고 다음 tick으로 넘긴다. 같은 tick의 `due`는
+  작업이 끝나기 전에 계산됐을 수 있어(방금 복구한 slot이 아직 due로 남음) 같은 카메라를 곧바로 다시 복구할 수 있기 때문이다.
+- mode는 감시 쪽(제어 루프 스레드)에서 정해 `recover_source(index, mode)`로 넘긴다. 로그의 mode와 실제 실행이 같다.
+- kick의 `send_event`는 예외를 삼킨다. kick 실패가 제어 루프를 끝내면 이 설계의 목표에 어긋난다.
+- 종료 join 시간은 상수 `RECOVERY_JOIN_TIMEOUT = 5`. 세 로그의 `seconds`는 모두 작업 시작 기준(hung 30, abandoned 40 전후).
+- §4-3 flush_stop은 NULL이 FAILURE가 아닐 때만 보낸다(실패하면 기존대로 `source_reset_failed`로 끝나고, 다음 복구가
+  재생성이면 `detach_source()`가 보낸다).
+- 테스트 harness는 `time`을 fake `monotonic`(test.now)으로, `threading.Thread`를 기록용 subclass로, `faulthandler`를
+  기록용 fake로 주입하고 bus pop마다 작업 스레드 완료를 기다린다(멈춘 NULL 제외). SIGUSR1 등록은 테스트가 없다.
 전제: [1단계 재설정](2026-11-03-camera-source-recovery-design.md), [2단계 재생성](2026-11-04-camera-source-rebuild-design.md),
 예외 격리(6461596), 미연결 카메라 재설정만(eb5e699). 관련 코드: `preview.py` `recover_source`/`reset_source`/`rebuild_source`와
 제어 루프, `camera_runtime.py`.

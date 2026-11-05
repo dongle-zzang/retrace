@@ -3,6 +3,7 @@
 
 import argparse
 import contextlib
+import faulthandler
 import json
 import os
 from pathlib import Path
@@ -50,6 +51,10 @@ WEB_ROOT = ROOT / "web"
 DEEPSTREAM_ROOT = Path("/opt/nvidia/deepstream/deepstream")
 TRACKER_CONFIG = DEEPSTREAM_ROOT / "samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml"
 TRACKER_LIBRARY = DEEPSTREAM_ROOT / "lib/libnvds_nvmultiobjecttracker.so"
+# A recovery worker still running after HUNG_AFTER s gets one flush_start kick, then KICK_WAIT s before abandon.
+RECOVERY_HUNG_AFTER = 30
+RECOVERY_KICK_WAIT = 10
+RECOVERY_JOIN_TIMEOUT = 5
 
 
 class SafeParser(argparse.ArgumentParser):
@@ -847,6 +852,8 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
         if source_bin.set_state(Gst.State.NULL) == Gst.StateChangeReturn.FAILURE:
             failed("null")
             return
+        # runtime_source_add_delete order; also leaves the flushing a hung-recovery kick started.
+        mux_pads[index].send_event(Gst.Event.new_flush_stop(False))
         ghost_pad = source_bin.get_static_pad("src")
         target = ghost_pad.get_target()
         if target is not None and target.get_parent() is None:
@@ -921,16 +928,12 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
               "recovery_count": manager.runtimes[camera.source_id].snapshot().recovery_count},
               separators=(",", ":")), flush=True)
 
-    def recover_source(index):
-        """One recovery per tick: reset in place first, rebuild from the second recovery on.
+    def recover_source(index, mode):
+        """Reset in place first, rebuild from the second recovery on; runs on a recovery worker.
 
         A plugin exception inside a recovery must not take the shared pipeline down with it:
         the slot is deferred like a failed recovery and the control loop goes on.
         """
-        if source_bins.get(index) is None or (rebuild_enabled and manager.recovery_mode(index) == "rebuild"):
-            mode = "rebuild"
-        else:
-            mode = "reset"
         try:
             (rebuild_source if mode == "rebuild" else reset_source)(index)
         except Exception:
@@ -939,6 +942,48 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
             print("source_recovery_error " + json.dumps({"camera_id": camera.camera_id, "source_id": camera.source_id,
                   "mode": mode}, separators=(",", ":")), flush=True)
 
+    def recovery_log(event, recovery):
+        camera = cameras_by_source[recovery["slot"]]
+        print(f"source_recovery_{event} " + json.dumps({"camera_id": camera.camera_id, "source_id": camera.source_id,
+              "mode": recovery["mode"], "seconds": round(time.monotonic() - recovery["started"], 1)},
+              separators=(",", ":")), flush=True)
+
+    def supervise_recovery(due):
+        """Run one recovery at a time on a worker so a native call that never returns cannot stop this loop."""
+        nonlocal inflight
+        if inflight is not None:
+            now = time.monotonic()
+            if not inflight["thread"].is_alive():
+                if inflight["kicked"] is not None:
+                    recovery_log("unblocked", inflight)
+                inflight = None
+            elif inflight["kicked"] is None and now - inflight["started"] >= RECOVERY_HUNG_AFTER:
+                recovery_log("hung", inflight)
+                faulthandler.dump_traceback(all_threads=True)
+                mux_pad = mux_pads.get(inflight["slot"])
+                if mux_pad is not None:
+                    # A streaming thread blocked in the mux sink pad leaves on FLUSHING and frees the stream lock.
+                    with contextlib.suppress(Exception):
+                        mux_pad.send_event(Gst.Event.new_flush_start())
+                inflight["kicked"] = now
+            elif inflight["kicked"] is not None and now - inflight["kicked"] >= RECOVERY_KICK_WAIT:
+                recovery_log("abandoned", inflight)
+                manager.abandon_recovery(inflight["slot"])
+                inflight = None  # the daemon worker is left behind; other slots may recover again
+            return  # a slot freed this tick waits for the next tick() so `due` is not stale
+        if not due or shutdown.is_set() or pipeline_stop.is_set():
+            return
+        index = due[0]
+        if source_bins.get(index) is None or (rebuild_enabled and manager.recovery_mode(index) == "rebuild"):
+            mode = "rebuild"
+        else:
+            mode = "reset"
+        thread = threading.Thread(target=recover_source, args=(index, mode), name=f"source-recovery-{index}",
+                                  daemon=True)
+        inflight = {"slot": index, "mode": mode, "thread": thread, "started": time.monotonic(), "kicked": None}
+        thread.start()
+
+    inflight = None
     rebuild_enabled = getattr(args, "source_recovery_rebuild", True)
     try:
         pipeline = Gst.Pipeline.new("preview-detection")
@@ -1074,9 +1119,7 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
                 message = bus.timed_pop_filtered(100 * Gst.MSECOND, message_types)
                 if message is not None:
                     on_message(bus, message)
-                due = manager.tick()
-                if due and not shutdown.is_set() and not pipeline_stop.is_set():
-                    recover_source(due[0])  # one bin per tick; the rest stay offline until later ticks
+                supervise_recovery(manager.tick())  # one bin at a time; the rest stay offline until later ticks
                 if deployment is not None:
                     try:
                         deployment.tick()
@@ -1111,6 +1154,9 @@ def run_shared_pipeline(args, metadata_store, stores, manager, shutdown):
         if deployment is not None:
             with contextlib.suppress(Exception):
                 deployment.close()
+        if inflight is not None:
+            # A hung worker may hold its bin; past this wait docker's stop grace period ends the process.
+            inflight["thread"].join(RECOVERY_JOIN_TIMEOUT)
         if pipeline is not None:
             pipeline.set_state(Gst.State.NULL)
         for owner, pad in reversed(requested_pads):
@@ -1234,6 +1280,8 @@ def run(args, metadata_store=None, runtime_statuses=None):
     try:
         for signum in (signal.SIGINT, signal.SIGTERM):
             old_handlers[signum] = signal.signal(signum, on_signal)
+        # `docker compose kill -s SIGUSR1 retrace` dumps every Python thread's line before a restart.
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
         http_thread.start()
         parking_relay.thread.start()
         print(f"Preview HTTP listening on 0.0.0.0:{args.port}; shared camera pipeline", flush=True)

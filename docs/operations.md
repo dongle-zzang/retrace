@@ -218,10 +218,11 @@ decoded PTS에 관측 generation을 연결해 tracker/encoder에 대기 중이�
 
 source 복구 정책: 프레임을 한 장도 받지 못한 관측 시도가 2회 연속 끝나면(마지막 프레임 후 약 73초,
 기동 후 한 번도 안 뜬 카메라는 PLAYING 후 약 63초) 제어 루프가 그 카메라의 `source-bin-N`만 NULL → PLAYING으로
-재설정합니다(deepstream-app `reset_source_pipeline`과 같은 방식). mux sink pad, ghost pad, probe는 유지되고
+재설정합니다(deepstream-app `reset_source_pipeline`과 같은 방식). NULL 직후 mux `sink_N`에 flush-stop을 보내고
+(NVIDIA `runtime_source_add_delete` 순서, 아래 감시 kick의 flushing 해제), mux sink pad, ghost pad, probe는 유지되며
 nvurisrcbin이 RTSP 연결과 디코더를 다시 만듭니다. ghost pad target은 plugin이 pad-removed 없이 pad를 버린
 경우에만 비웁니다. 재설정 간격은 120 → 300 → 600초(최대, 포기하지 않음)이며 30초 이상 안정 수신 후
-초기화됩니다. tick당 1대만 재설정합니다. `/streams.json` runtime과 `camera_status` 로그의 `recovery_count`가
+초기화됩니다. 한 번에 1대만 복구합니다. `/streams.json` runtime과 `camera_status` 로그의 `recovery_count`가
 증가하고 `source_reset {camera_id, source_id, generation, recovery_count}` 한 줄을 항상 출력합니다. 재설정
 자체가 실패하면 `source_reset_failed {camera_id, source_id, stage}`를 남기고 last_error=pipeline_error로 다음
 간격까지 미루며 일반 관측 재시도는 계속됩니다. `--no-source-recovery`로 끄면 기존 관측 재시도만 수행합니다.
@@ -244,6 +245,26 @@ reset/rebuild, 원문 없음)를 남기고 실패한 복구와 같이 다음 간
 `pipeline_source=X: GStreamer WARNING factory=<plugin>; details hidden` 줄은 경고를 낸 element의 factory 이름
 (`[a-z0-9_]{1,32}` 외는 `other`)을 함께 적어 재생성 직후 어느 공유 element가 거부하는지 확인하는 데 씁니다.
 `source_rtsp` JSON에도 같은 `factory` 필드가 실립니다.
+
+복구 감시(2026-11-05, [설계](superpowers/specs/2026-11-05-camera-recovery-watchdog-design.md)): 재설정·재생성은 제어
+루프가 아니라 daemon 작업 스레드 `source-recovery-N`에서 돕니다. 복구 중 native 호출(`set_state(NULL)` 등)이
+돌아오지 않아도 상태 갱신, offline 전환, `camera_status`, 차량 모델 배포 tick은 계속됩니다(2026-11-04 6f_lobby
+재설정에서 제어 루프가 17.8시간 멈춘 사고 대응). 작업이 30초를 넘기면 `source_recovery_hung {camera_id, source_id,
+mode, seconds}`를 출력하고 모든 Python 스레드의 현재 줄(파일·함수·줄 번호만)을 stderr에 덤프한 뒤 mux `sink_N`에
+flush-start를 한 번 보냅니다(kick: 막힌 스트리밍 스레드를 빼내 stream lock을 푸는 시도, 효과는 실환경 미검증). 이후
+작업이 끝나면 `source_recovery_unblocked`, 10초 안에 끝나지 않으면 `source_recovery_abandoned`(필드 동일)를 남기고
+그 카메라를 복구 대상에서 뺍니다. 포기된 카메라는 일반 관측 재시도만 받고 `recovery_count`가 멈추며, 재시작 전까지
+자동 복구되지 않습니다(버려진 스레드가 나중에 스스로 끝나면 다시 복구 대상이 됨). 다른 카메라 복구는 다음 tick부터
+가능합니다. 세 로그는 diagnostics와 무관하게 항상 출력됩니다. 종료 시 진행 중 작업은 최대 5초만 기다립니다. 멈춘
+작업이 bin을 잡고 있으면 pipeline NULL 전환이 막혀 docker stop grace period(기본 10초) 뒤 강제 종료될 수 있고,
+결과는 일반 재시작과 같습니다. 제어 루프가 다른 이유로 멈춘 것 같으면 재시작 전에
+`sudo docker compose kill -s SIGUSR1 retrace`로 모든 스레드 스택을 로그에 남깁니다(compose `init: true`가 신호를
+전달). 일일 확인:
+
+```bash
+sudo docker compose logs -t --since=1m retrace | grep -c camera_status   # 252 전후(21대 × 12회), 0이면 루프 정지 → 재시작
+sudo docker compose logs -t --since=24h retrace | grep -E 'source_recovery_(hung|unblocked|abandoned)'
+```
 
 기존 `/streams.json`에 runtime 객체를 추가합니다. 호환 status는 connected/starting을 유지하고
 실제 상태는 runtime.state로 확인합니다. `run(..., runtime_statuses={})`에 전달한 dict에는
