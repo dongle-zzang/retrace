@@ -333,6 +333,16 @@ class SharedTests(unittest.TestCase):
         self.assertEqual(self.probe_steps(run, 'vehicle-segmentation', 'src'), ['attach_masks', 'prepare_tracks'])
         self.assertEqual(run['display_masks'], {0: True, 1: True, 2: False})  # camera_2 is not a parking camera
         self.assertIn('vehicle_segmentation graft=unknown', run['captured'])
+        self.assertIn('vehicle_segmentation interval_s=2.0 ring_cells=2 box_width=0 '
+                      'guard_ms_per_s=200 guard_windows=3', run['captured'])
+        # The detector sink step hands the seg runtime to add_vehicle_rois (seg ROI every interval, A).
+        add_rois = next(args[2] for args in run['callbacks'][('vehicle-inference', 'sink')]
+                        if args[1].__name__ == 'vehicle_probe')[0]
+        calls = []
+        add_rois.__globals__.update(add_vehicle_rois=lambda *call: calls.append(call), pyds=NS())
+        add_rois('batch')
+        self.assertEqual(type(calls[0][4]).__name__, 'OutlineRuntime')
+        self.assertEqual(calls[0][4].interval, 2.0)
 
     def test_segmentation_requires_the_vehicle_detector(self):
         run = self.construct(2, segmenter_enabled=True)
@@ -714,9 +724,11 @@ class SharedTests(unittest.TestCase):
                          bus_observer=lambda *args: lambda *args: None,
                          InferenceDiagnostics=lambda: NS(), TRACKER_CONFIG='unused',
                          log_settings=lambda *args: None)
-        from vehicle_detection import add_vehicle_rois, prepare_vehicle_tracks, attach_vehicle_masks, graft_status
+        from vehicle_detection import (add_vehicle_rois, prepare_vehicle_tracks, graft_status, OutlineRuntime,
+                                       SEG_GUARD_MS_PER_S, SEG_GUARD_WINDOWS)
         namespace.update(add_vehicle_rois=add_vehicle_rois, prepare_vehicle_tracks=prepare_vehicle_tracks,
-                         attach_vehicle_masks=attach_vehicle_masks, graft_status=graft_status)
+                         graft_status=graft_status, OutlineRuntime=OutlineRuntime,
+                         SEG_GUARD_MS_PER_S=SEG_GUARD_MS_PER_S, SEG_GUARD_WINDOWS=SEG_GUARD_WINDOWS)
         namespace = load_preview({'run_shared_pipeline', 'CameraFrameSink'}, namespace)
         args = NS(cameras=list(manager.cameras_by_slot.values()), input=['private'] * count,
                   diagnostics=diagnostics, mux_live_source=1, rtsp_latency=1000, rtsp_drop_on_latency=False,
@@ -736,7 +748,8 @@ class SharedTests(unittest.TestCase):
                 seg_config = Path(directory) / 'seg.txt'
                 seg_config.write_text(f'[property]\nmodel-engine-file={Path(directory) / "seg.engine"}\n')
                 args.vehicle_segmenter = NS(cameras=frozenset({'camera_0', 'camera_1'}), config_path=str(seg_config),
-                                            vehicle_class_ids=frozenset({0}), det_weights_sha256=None, box_width=1)
+                                            vehicle_class_ids=frozenset({0}), det_weights_sha256=None, box_width=0,
+                                            interval=2.0, ring_cells=2)
             error = namespace['run_shared_pipeline'](args, manager.metadata_store, manager.stores, manager, shutdown)
         self.assertIsNone(error)
         pipeline = next(e for e in elements if e.factory == 'pipeline')

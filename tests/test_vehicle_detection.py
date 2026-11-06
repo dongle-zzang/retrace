@@ -12,7 +12,8 @@ from preview_socket import detection_message
 from vehicle_detection import (prepare_vehicle_detector, add_vehicle_rois, prepare_vehicle_tracks,
                                VehicleDetector, VEHICLE_TRACKER_CLASS,
                                outline_from_grid, resample_mask, ring_mask, vehicle_outline,
-                               prepare_vehicle_segmenter, outline_box_width, graft_status, VehicleSegmenter)
+                               prepare_vehicle_segmenter, outline_box_width, graft_status, VehicleSegmenter,
+                               OutlineRuntime, outline_settings, SEG_ROI_CLASS, VEHICLE_ROI_ID)
 
 
 def nodes(values):
@@ -111,8 +112,9 @@ class SegmenterTests(unittest.TestCase):
         parser = configparser.ConfigParser()
         parser.read(seg.config_path)
         props = parser['property']
+        # Seg infers only the seg ROI (class 1) that OutlineRuntime adds every VEHICLE_SEG_INTERVAL seconds.
         for key, value in {'process-mode': '2', 'network-type': '3', 'output-instance-mask': '1', 'cluster-mode': '4',
-                           'gie-unique-id': '3', 'operate-on-gie-id': '90', 'operate-on-class-ids': '0',
+                           'gie-unique-id': '3', 'operate-on-gie-id': '90', 'operate-on-class-ids': '1',
                            'batch-size': '2', 'interval': '0', 'gpu-id': '0',
                            'filter-out-class-ids': '0;1;3;4;6'}.items():
             self.assertEqual(props[key], value, key)
@@ -122,8 +124,14 @@ class SegmenterTests(unittest.TestCase):
         self.assertEqual(self.targets[-1], str(self.root / 'vehicle-seg'))
         self.assertEqual(Path(seg.config_path).name, 'vehicle_seg_fixture.txt')
         self.assertEqual((seg.cameras, seg.vehicle_class_ids, seg.box_width, seg.det_weights_sha256),
-                         (frozenset({'p1', 'p2'}), frozenset({2, 5, 7}), 1, None))
-        self.assertEqual(self.segmenter(VEHICLE_OUTLINE_BOX_WIDTH='0').box_width, 0)
+                         (frozenset({'p1', 'p2'}), frozenset({2, 5, 7}), 0, None))
+        self.assertEqual((seg.interval, seg.ring_cells), (2.0, 2))
+        self.assertEqual(self.segmenter(VEHICLE_OUTLINE_BOX_WIDTH='1').box_width, 1)
+        tuned = self.segmenter(VEHICLE_SEG_INTERVAL='0.5', VEHICLE_OUTLINE_RING_CELLS='3')
+        self.assertEqual((tuned.interval, tuned.ring_cells), (.5, 3))
+        # The detector's config keeps operating on the per-frame ROI (class 0).
+        parser.read(self.detector.config_path)
+        self.assertEqual(parser['property']['operate-on-class-ids'], '0')
 
     def test_segmenter_reads_graft_manifest(self):
         (self.root / 'seg' / 'manifest.json').write_text('{"det_weights_sha256": "%s"}' % ('a' * 64))
@@ -142,9 +150,20 @@ class SegmenterTests(unittest.TestCase):
         self.assertNotIn(str(self.root), printed.call_args.args[0])
 
     def test_outline_box_width(self):
-        for raw, expected in ((None, 1), ('0', 0), ('3', 3), (' 2 ', 2), ('4', 1), ('-1', 1), ('abc', 1), ('1.5', 1)):
+        # Default 0 (2026-11-06): a vehicle with an outline shows only its outline and label.
+        for raw, expected in ((None, 0), ('0', 0), ('3', 3), (' 2 ', 2), ('4', 0), ('-1', 0), ('abc', 0), ('1.5', 0)):
             with patch('builtins.print'):
                 self.assertEqual(outline_box_width({} if raw is None else {'VEHICLE_OUTLINE_BOX_WIDTH': raw}), expected)
+
+    def test_outline_settings_fall_back_on_invalid_values(self):
+        cases = (({}, (2.0, 2)), ({'VEHICLE_SEG_INTERVAL': '1'}, (1.0, 2)), ({'VEHICLE_SEG_INTERVAL': ' 0.2 '}, (.2, 2)),
+                 ({'VEHICLE_SEG_INTERVAL': '0.1'}, (2.0, 2)), ({'VEHICLE_SEG_INTERVAL': 'nan'}, (2.0, 2)),
+                 ({'VEHICLE_SEG_INTERVAL': '61'}, (2.0, 2)), ({'VEHICLE_OUTLINE_RING_CELLS': '1'}, (2.0, 1)),
+                 ({'VEHICLE_OUTLINE_RING_CELLS': '4'}, (2.0, 4)), ({'VEHICLE_OUTLINE_RING_CELLS': '5'}, (2.0, 2)),
+                 ({'VEHICLE_OUTLINE_RING_CELLS': 'x'}, (2.0, 2)))
+        for env, expected in cases:
+            with patch('builtins.print'):
+                self.assertEqual(outline_settings(env), expected, env)
 
     def test_graft_status_compares_the_graft_with_the_active_detector_weights(self):
         seg = VehicleSegmenter(frozenset({'p1'}), 'unused', frozenset({2}), det_weights_sha256='a' * 64)
@@ -199,7 +218,7 @@ PARKING_SEGMENTER = VehicleSegmenter(frozenset({'parking'}), 'unused', frozenset
 
 
 def batch_with(**frames):
-    return NS(frame_meta_list=nodes([NS(camera_id=camera, obj_meta_list=nodes(objects))
+    return NS(frame_meta_list=nodes([NS(camera_id=camera, frame_num=1, obj_meta_list=nodes(objects))
                                      for camera, objects in frames.items()]))
 
 
@@ -217,6 +236,8 @@ class MaskAttachTests(unittest.TestCase):
         self.assertEqual((mask.width, mask.height, mask.threshold), (75, 50, .5))
         grid = mask.allocated.reshape(50, 75)
         self.assertTrue(grid[0].all())  # the exact seg won: the shifted one leaves the left cells empty
+        self.assertTrue(grid[1].all())  # default ring is two cells thick
+        self.assertFalse(grid[2, 30])
         self.assertFalse(grid[25, 30])  # ring: interior removed
         self.assertIsNone(det_b.mask_params.allocated)  # nothing overlaps it by IoU >= 0.5
         for unused in (shifted, far):
@@ -273,6 +294,15 @@ class OutlineTests(unittest.TestCase):
         ring = ring_mask(car_grid())
         self.assertTrue(ring[car_grid()].any())
         self.assertFalse(ring[25, 30])  # interior removed, the border stays
+
+    def test_thick_ring_keeps_the_outline_and_is_k_cells_wide(self):
+        full = np.ones((10, 10), bool)
+        self.assertEqual(ring_mask(full).sum(), 100 - 64)
+        self.assertEqual(ring_mask(full, 2).sum(), 100 - 36)
+        self.assertEqual(ring_mask(full, 4).sum(), 100 - 4)
+        for cells in (1, 2, 3, 4):
+            self.assertEqual(outline_from_grid(ring_mask(car_grid(), cells), 0, 0, 300, 200),
+                             outline_from_grid(car_grid(), 0, 0, 300, 200))
 
     def test_empty_single_row_and_tiny_masks_have_no_outline(self):
         self.assertIsNone(outline_from_grid(np.zeros((5, 5), bool), 0, 0, 20, 20))
@@ -460,6 +490,168 @@ class VehicleTests(unittest.TestCase):
         self.assertEqual(message['persons'], [])
         self.assertEqual(message['vehicles'][0]['trackId'], str((1 << 63) + 3))
         self.assertEqual(message['vehicles'][0]['bbox']['x'], .1)
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+def tracked(object_id, left=800.0, top=500.0, width=300.0, height=200.0, mask=None):
+    return NS(object_id=object_id, mask_params=mask or FakeMask(),
+              rect_params=NS(left=left, top=top, width=width, height=height))
+
+
+def ring_on(obj, cells=2):
+    """What the seg src probe leaves on a det vehicle: the ring of car_grid() on its box."""
+    ring = ring_mask(car_grid(), cells).astype(np.float32).ravel()
+    obj.mask_params = FakeMask(75, 50, ring)
+    return obj
+
+
+class OutlineRuntimeTests(unittest.TestCase):
+    """A (seg every VEHICLE_SEG_INTERVAL s, outlines reused per track) and E (automatic suspension)."""
+    def setUp(self):
+        self.clock = FakeClock()
+        self.logs = []
+        self.segmenter = VehicleSegmenter(frozenset({'p1', 'p2'}), 'unused', frozenset({2, 5, 7}), interval=2.0)
+        self.detector = VehicleDetector(frozenset({'p1', 'p2'}), 'unused', 2, frozenset({2, 5, 7}))
+        self.runtime = OutlineRuntime(self.segmenter, self.detector, clock=self.clock, log=self.logs.append)
+
+    def rois(self, *cameras, frame_num=1):
+        frames = [NS(camera_id=camera, frame_num=frame_num, bInferDone=True, obj_meta_list=None) for camera in cameras]
+        added = {camera: [] for camera in cameras}
+        def acquire(batch):
+            return NS(rect_params=NS())
+        def add(frame, obj, parent):
+            added[frame.camera_id].append(obj.class_id)
+        pyds = NS(NvDsFrameMeta=NS(cast=lambda v: v), nvds_acquire_obj_meta_from_pool=acquire,
+                  nvds_add_obj_meta_to_frame=add)
+        add_vehicle_rois(NS(frame_meta_list=nodes(frames)), self.detector, lambda f: f, pyds, self.runtime)
+        return added
+
+    def test_seg_roi_goes_to_one_due_camera_per_batch_and_repeats_after_the_interval(self):
+        self.assertEqual(SEG_ROI_CLASS, 1)
+        self.assertEqual(self.rois('p1', 'p2', 'lobby'), {'p1': [0, SEG_ROI_CLASS], 'p2': [0], 'lobby': []})
+        self.assertEqual(self.rois('p1', 'p2'), {'p1': [0], 'p2': [0, SEG_ROI_CLASS]})  # staggered
+        self.assertEqual(self.rois('p1', 'p2'), {'p1': [0], 'p2': [0]})
+        self.clock.now = 1.9
+        self.assertEqual(self.rois('p1', 'p2'), {'p1': [0], 'p2': [0]})
+        self.clock.now = 2.0
+        self.assertEqual(self.rois('p1', 'p2'), {'p1': [0, SEG_ROI_CLASS], 'p2': [0]})
+        self.assertEqual(self.rois('p1', 'p2'), {'p1': [0], 'p2': [0, SEG_ROI_CLASS]})
+        self.assertEqual(self.runtime.snapshot()['seg_frames'], 4)
+
+    def test_without_runtime_only_the_detector_roi_is_added(self):
+        frame = NS(camera_id='p1', frame_num=1, bInferDone=True, obj_meta_list=None)
+        added = []
+        pyds = NS(NvDsFrameMeta=NS(cast=lambda v: v), nvds_acquire_obj_meta_from_pool=lambda b: NS(rect_params=NS()),
+                  nvds_add_obj_meta_to_frame=lambda f, obj, parent: added.append((obj.unique_component_id, obj.class_id)))
+        add_vehicle_rois(NS(frame_meta_list=nodes([frame])), self.detector, lambda f: f, pyds)
+        self.assertEqual(added, [(VEHICLE_ROI_ID, 0)])
+
+    def test_masks_attach_only_on_frames_that_got_a_seg_roi(self):
+        self.rois('p1', frame_num=7)
+        due_det, other_det = det(800, 500), det(800, 500)
+        due = NS(camera_id='p1', frame_num=7, obj_meta_list=nodes([due_det, seg(800, 500)]))
+        skipped = NS(camera_id='p1', frame_num=8, obj_meta_list=nodes([other_det, seg(800, 500)]))
+        self.assertEqual(self.runtime.attach(NS(frame_meta_list=nodes([skipped, due])), lambda f: f, PYDS), 0)
+        self.assertIsNotNone(due_det.mask_params.allocated)
+        self.assertIsNone(other_det.mask_params.allocated)
+        stats = self.runtime.snapshot()
+        self.assertEqual((stats['seg_objects'], stats['seg_mask_floats'], stats['paired'], stats['attached']),
+                         (1, 160 * 160, 1, 1))
+        for key in ('scan_ms_per_s', 'mask_read_ms_per_s', 'mask_write_ms_per_s', 'probe_ms_per_s', 'attach_max_ms'):
+            self.assertGreaterEqual(stats[key], 0, key)
+        # The pending seg frame is consumed once.
+        self.assertEqual(self.runtime.attach(NS(frame_meta_list=nodes([due])), lambda f: f, PYDS), 0)
+        self.assertEqual(self.runtime.snapshot()['seg_objects'], 0)
+
+    def test_seg_frame_outline_is_cached_and_reattached_on_later_frames(self):
+        car = ring_on(tracked(5))
+        expected = outline_from_grid(ring_mask(car_grid()), 800.0, 500.0, 300.0, 200.0)
+        self.assertEqual(self.runtime.track_outline(car, 'p1'), expected)
+        later = tracked(5, left=820.0, top=510.0, width=330.0, height=220.0)
+        self.clock.now = 3.0
+        outline = self.runtime.track_outline(later, 'p1')
+        self.assertEqual(outline, outline_from_grid(ring_mask(car_grid()), 820.0, 510.0, 330.0, 220.0))
+        mask = later.mask_params
+        self.assertEqual((mask.width, mask.height, mask.threshold), (75, 50, .5))
+        np.testing.assert_array_equal(mask.allocated, ring_mask(car_grid(), 2).astype(np.float32).ravel())
+        # Another camera's track with the same id and an untracked object get nothing.
+        self.assertIsNone(self.runtime.track_outline(tracked(5), 'p2'))
+        untracked = ring_on(tracked((1 << 64) - 1))
+        self.assertIsNotNone(self.runtime.track_outline(untracked, 'p1'))
+        self.assertIsNone(self.runtime.track_outline(tracked((1 << 64) - 1), 'p1'))
+        stats = self.runtime.snapshot()
+        self.assertEqual((stats['reattached'], stats['cache_tracks']), (1, 1))
+
+    def test_cached_outline_expires_after_three_intervals(self):
+        self.runtime.track_outline(ring_on(tracked(5)), 'p1')
+        self.clock.now = 6.0
+        self.assertIsNotNone(self.runtime.track_outline(tracked(5), 'p1'))
+        self.clock.now = 6.1
+        self.assertIsNone(self.runtime.track_outline(tracked(5), 'p1'))
+        self.assertEqual(self.runtime.snapshot()['cache_tracks'], 0)
+
+    def test_broken_mask_gives_no_outline_and_never_raises(self):
+        broken = ring_on(tracked(5))
+        broken.mask_params.width = 74
+        self.assertIsNone(self.runtime.track_outline(broken, 'p1'))
+        self.assertIsNone(self.runtime.track_outline(NS(object_id=6), 'p1'))
+        self.assertGreaterEqual(self.runtime.snapshot()['errors'], 1)
+
+    def over_budget_window(self):
+        # 1.1 s of seg Python work in a 5 s window = 220 ms/s, above the 200 ms/s guard.
+        self.runtime.record_cost(1.1)
+        self.clock.now += 5.0
+        self.rois('p1', 'p2')
+
+    def test_three_windows_over_200_ms_per_s_suspend_seg_rois(self):
+        self.runtime.track_outline(ring_on(tracked(5)), 'p1')
+        self.over_budget_window()
+        self.over_budget_window()
+        self.assertEqual(self.logs, [])
+        self.assertFalse(self.runtime.suspended)
+        self.over_budget_window()  # 15 s over budget
+        self.assertTrue(self.runtime.suspended)
+        self.assertEqual(len(self.logs), 1)
+        self.assertTrue(self.logs[0].startswith('vehicle_segmentation_suspended {'), self.logs[0])
+        self.assertIn('"retry_after_s":600', self.logs[0])
+        self.clock.now += 10
+        self.assertEqual(self.rois('p1', 'p2'), {'p1': [0], 'p2': [0]})  # no seg ROI while suspended
+        self.assertIsNone(self.runtime.track_outline(tracked(5), 'p1'))  # cached outlines dropped too
+        stats = self.runtime.snapshot()
+        self.assertEqual((stats['state'], stats['trips'], stats['cache_tracks']), ('suspended', 1, 0))
+
+    def test_a_window_under_budget_resets_the_count(self):
+        self.over_budget_window()
+        self.over_budget_window()
+        self.runtime.record_cost(1.0)  # exactly 200 ms/s is allowed
+        self.clock.now += 5.0
+        self.rois('p1')
+        self.over_budget_window()
+        self.over_budget_window()
+        self.assertFalse(self.runtime.suspended)
+
+    def test_suspension_retries_with_doubling_backoff_capped_at_an_hour(self):
+        retries = []
+        for _ in range(5):
+            for _ in range(3):
+                self.over_budget_window()
+            self.assertTrue(self.runtime.suspended)
+            retry = int(self.logs[-1].split('"retry_after_s":')[1].split(',')[0].rstrip('}'))
+            retries.append(retry)
+            self.clock.now += retry - 1
+            self.assertEqual(self.rois('p1')['p1'], [0])
+            self.clock.now += 1
+            self.assertEqual(self.rois('p1')['p1'], [0, SEG_ROI_CLASS])
+            self.assertFalse(self.runtime.suspended)
+            self.assertTrue(self.logs[-1].startswith('vehicle_segmentation_resumed {'), self.logs[-1])
+        self.assertEqual(retries, [600, 1200, 2400, 3600, 3600])
 
 
 if __name__ == '__main__':

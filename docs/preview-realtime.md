@@ -15,8 +15,8 @@ RTSP → nvurisrcbin(NVMM) → nvstreammux → 차량 nvinfer(주차장 카메�
 ```
 
 JPEG에는 서버 OSD(주차장 카메라의 차량 bbox와 `Vehicle` 라벨만)가 그려져 있다. seg(`VEHICLE_SEG_INFER_CONFIG`)를 켜면
-주차장 카메라 차량에 윤곽선이 그려지고, 윤곽이 붙은 차량의 박스는 `VEHICLE_OUTLINE_BOX_WIDTH`(기본 1, 0이면 숨김)로
-얇아진다. 윤곽이 없는 차량은 기존 굵은 박스다([운영](operations.md#차량-윤곽선seg-선택)). 차량 track ID는 metadata에만 있다. 같은 정보가 `/ws` detections로도 오므로
+주차장 카메라 차량에 윤곽선이 그려지고, 윤곽이 붙은 차량의 박스는 `VEHICLE_OUTLINE_BOX_WIDTH`(기본 0 = 숨김, 글자는 남음)를
+따른다. 윤곽이 없는 차량은 기존 굵은 박스다([운영](operations.md#차량-윤곽선seg-선택)). 차량 track ID는 metadata에만 있다. 같은 정보가 `/ws` detections로도 오므로
 제품 화면은 JPEG만 표시하거나 별도 overlay를 그릴 수 있다.
 
 브라우저는 HTTP/1.1에서 origin당 동시 연결을 6개로 제한한다. `/mjpeg/sourceN`은 응답을 계속 열어 두므로

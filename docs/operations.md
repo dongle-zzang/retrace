@@ -167,20 +167,32 @@ GPU/TensorRT 환경이 다른 장비의 engine을 그대로 복사하지 않습�
 | 환경 변수 | 기본 | 역할 |
 | --- | --- | --- |
 | `VEHICLE_SEG_INFER_CONFIG` | 빈 값(끔) | seg nvinfer config. 비우면 seg element가 없고 pipeline·OSD는 이전과 같다(JSON의 `outline`은 null) |
-| `VEHICLE_OUTLINE_BOX_WIDTH` | 1 | 윤곽이 붙은 차량의 박스 두께 0–3. 0은 박스를 숨기고 `Vehicle` 글자만 남긴다. 그 밖의 값은 1 |
+| `VEHICLE_OUTLINE_BOX_WIDTH` | 0 | 윤곽이 붙은 차량의 박스 두께 0–3. 0은 박스를 숨기고 `Vehicle` 글자만 남긴다. 그 밖의 값은 0. 윤곽이 없는 차량은 늘 3 |
+| `VEHICLE_SEG_INTERVAL` | 2 | 주차장 카메라 한 대를 seg로 추론하는 간격(초, 0.2–60). batch마다 많아야 한 카메라. 그 사이 프레임은 track별 마지막 윤곽을 다시 붙인다(최대 3 간격). 범위 밖은 2 |
+| `VEHICLE_OUTLINE_RING_CELLS` | 2 | 윤곽선 두께(칸, 1–4). 1칸 = 4 mux px ≈ JPEG 2.7 px. 범위 밖은 2 |
 
 seg 준비가 실패하면 `Vehicle segmentation unavailable; details hidden; outlines disabled`를 남기고 seg 없이
 시작합니다(차량 검출은 그대로). 시작 로그 `vehicle_segmentation graft=match|stale|unknown`은 이식에 쓴 det
 가중치가 OTA 활성 det와 같은지 보여 줍니다. `stale`이면 `WARNING`이 붙고, 아래 G1과 G3을 새 best.pt로 다시 한 뒤
 재시작합니다(자동 재이식은 없음). 같은 값이 `--diagnostics` 5초 `vehicle_masks` 줄과 OTA가 켜져 있을 때
-`GET /api/training/deployment`의 `segmentation_graft`에도 나옵니다.
+`GET /api/training/deployment`의 `segmentation_graft`에도 나옵니다. 시작 로그 `vehicle_segmentation interval_s=...
+ring_cells=... box_width=... guard_ms_per_s=200 guard_windows=3`이 실제 적용값입니다.
+
+자동 보호(2026-11-06): seg 관련 Python 시간(mask 이식 + 윤곽 + 재부착)이 5초 창 3개 연속 200 ms/s를 넘으면 seg ROI를 더
+넣지 않고 `vehicle_segmentation_suspended {"ms_per_s", "windows", "trips", "retry_after_s"}`를 남깁니다(diagnostics와
+무관하게 항상). 그동안 seg 추론과 윤곽이 없고 차량은 3 px 박스로 돌아갑니다. `retry_after_s`(600 → 1200 → 2400 → 3600초,
+최대 1시간, 재시작하면 처음부터) 뒤 `vehicle_segmentation_resumed`와 함께 다시 시도합니다. 같은 상태가 `vehicle_masks`의
+`state`(`active`/`suspended`)와 `trips`에 보입니다. `vehicle_masks`의 시간 필드는 `scan`/`mask_read`/`mask_write`(seg src,
+seg 프레임만), `outline`(tracker, seg 프레임), `reattach`(tracker, 그 사이 프레임)별 `*_ms_per_s`와 합계 `probe_ms_per_s`,
+batch당 최대 `attach_max_ms`이고, 개수 필드는 `seg_frames`·`seg_objects`·`seg_mask_floats`(읽은 seg mask 크기 합)·`paired`·
+`attached`·`reattached`·`cache_tracks`·`errors`입니다.
 
 `models/yolo11m-seg/`(gitignore)에 둡니다: DeepStream-Yolo-Seg clone(commit `a8ec7ec`, MIT, 저장소 patch 적용),
 `graft.pt`·`manifest.json`(이식), `graft.onnx`·`labels.txt`(export), `vehicle_seg_infer.txt`.
 
-**주의(2026-11-06)**: 지금 구현으로 seg를 켜면 Python probe가 공유 pipeline을 묶어 **모든 카메라가 약 2 fps로
-떨어집니다**(2026-11-06 00:48 UTC 적용 후 되돌림). 처리량 수정([설계 문서](superpowers/specs/2026-11-05-vehicle-outline-segmentation-design.md) §10)이
-구현되기 전에는 G5를 하지 않습니다.
+**주의(2026-11-06)**: 처음 구현(매 프레임 seg)으로 seg를 켜자 Python probe가 공유 pipeline을 묶어 **모든 카메라가 약
+2 fps로 떨어졌습니다**(2026-11-06 00:48 UTC 적용 후 되돌림). seg 간격 제한·윤곽 재사용·자동 보호([설계 문서](superpowers/specs/2026-11-05-vehicle-outline-segmentation-design.md)
+§10-7)는 구현됐지만 GPU에서 아직 검증하지 않았습니다. 사용자가 시점을 정해 G6-1 → G5 → G6-2로 확인합니다.
 
 배포는 두 번에 나눕니다(2026-11-05 결정). 카메라 복구 감시(f6db046)와 seg를 한 번에 켜면 문제가 생겼을 때 원인을
 나눌 수 없고, 복구 감시만 적용된 상태가 seg 측정의 기준선이 되어야 하기 때문입니다.
@@ -279,6 +291,9 @@ OTA 상태 API에 `segmentation_graft`를 보이려면 `systemctl --user restart
 G6-2. seg를 켠 뒤 카메라가 다시 online이 되면 곧바로 G6-1과 같은 10분 측정을 합니다(보고 파일 `seg-on-<날짜>.json`).
 판정은 G6-1과 비교해 카메라별 fps ≥ 90%, 합계 ≥ 95%(설계 §5)입니다. 첫 5초 창부터 `vehicle_masks`의
 `probe_ms_per_s`가 수백 이상이거나 `fps=`가 전 카메라에서 함께 떨어지면 측정을 기다리지 말고 바로 되돌립니다.
+`vehicle_segmentation_suspended`가 찍혔으면 보호가 작동한 것이므로 그 줄과 직전 `vehicle_masks` 몇 줄을 기록하고 되돌립니다.
+이 측정의 `vehicle_masks` 시간 필드(특히 `mask_read_ms_per_s`와 `seg_mask_floats`)로 C++ 파서 mask 축소와 export topk
+축소(설계 §10-7)를 할지 정합니다.
 확인: 주차장 카메라 JPEG에 윤곽선과 얇은 박스(GPU 모드 `display-mask`와 색), 화면 가장자리 차량의 윤곽 위치,
 `curl -s http://127.0.0.1:8000/api/cameras/b1_parking_overview/vehicles`의 `outline`, `VEHICLE_OUTLINE_BOX_WIDTH=0`으로
 재생성했을 때 박스가 사라지고 글자가 같은 자리에 남는지, 24시간 RSS·VRAM 추이.

@@ -133,7 +133,7 @@ class ProbeIntegrationTests(unittest.TestCase):
         import ast
         import threading
         import time
-        from vehicle_detection import vehicle_outline
+        from vehicle_detection import OutlineRuntime
         from camera_config import Camera
         from camera_runtime import CameraRuntime, CameraRuntimeManager
         from preview_mjpeg import FrameStore
@@ -185,10 +185,9 @@ class ProbeIntegrationTests(unittest.TestCase):
             'pipeline_stop': threading.Event(), 'manager': manager,
             'vehicle_detector': NS(cameras={'camera_1'}, car_class_id=0),
             'fail': lambda *args: failures.append(args),
-            'segmenter': segmenter, 'vehicle_outline': vehicle_outline, 'time': time,
-            'mask_stats': {'cameras': {}}, 'costs': [],
+            'segmenter': segmenter, 'time': time, 'mask_stats': {'cameras': {}},
+            'outlines': OutlineRuntime(segmenter, None) if segmenter is not None else None,
         }
-        namespace['record_mask_cost'] = lambda seconds, errors=0: namespace['costs'].append((seconds, errors))
         exec(compile(ast.Module(body=functions, type_ignores=[]), 'preview.py', 'exec'), namespace)
         namespace['on_batch'](None, NS(get_buffer=lambda: 100))
         return NS(namespace=namespace, store=store, car=car, failures=failures, removed=removed, stray=stray,
@@ -209,7 +208,9 @@ class ProbeIntegrationTests(unittest.TestCase):
         self.assertEqual(run.car.rect_params.border_width, 0)
         self.assertEqual(run.car.text_params.display_text, 'Vehicle')
         self.assertEqual(run.namespace['mask_stats']['cameras'], {'camera_1': (1, 1)})
-        self.assertEqual(len(run.namespace['costs']), 1)
+        stats = run.namespace['outlines'].snapshot()
+        self.assertEqual(stats['cache_tracks'], 1)  # reused on frames without a seg ROI
+        self.assertGreater(stats['outline_ms_per_s'], 0)
         mask.size = 0  # this car got no mask from the seg nvinfer
         run = self.probe_scenario(segmenter, mask)
         self.assertIsNone(run.store.snapshot()[8].vehicles[0].outline)
@@ -223,7 +224,7 @@ class ProbeIntegrationTests(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertIsNone(store.snapshot()[8].vehicles[0].outline)  # segmentation off
         self.assertEqual(car.rect_params.border_width, 3)
-        self.assertEqual((namespace['costs'], namespace['mask_stats']), ([], {'cameras': {}}))
+        self.assertEqual(namespace['mask_stats'], {'cameras': {}})
         self.assertEqual(namespace['counts'], [1, 1])
         self.assertEqual(namespace['vehicle_counts'], [None, 1])
         self.assertEqual(removed, [stray])

@@ -5,7 +5,7 @@
 구현 계획은 [plans/2026-11-05-vehicle-outline-segmentation.md](../plans/2026-11-05-vehicle-outline-segmentation.md).
 구현됨(2026-11-05): CPU 테스트 통과, GPU 검증(§7-2)과 운영 적용은 대기. 운영 절차는 `docs/operations.md` "차량 윤곽선(seg, 선택)".
 **운영 적용 실패(2026-11-06)**: seg를 켜자 Python probe가 GIL을 포화시켜 전 카메라가 약 2.3 fps로 떨어져 되돌렸다. 원인
-분해와 수정안(승인 대기)은 §10. 지금 구현으로 seg를 다시 켜지 않는다.
+분해와 수정안은 §10. 사용자 조정안(0 → C → A+E, B는 계측 뒤)을 구현했다(§10-7, CPU 테스트 통과, GPU 검증 대기).
 
 구현 메모(설계와 다른 점):
 
@@ -346,7 +346,8 @@ seg를 켰고 객체에 `mask_params.size > 0`이면 mask 격자를 복사해 �
 
 5초마다 한 줄: `vehicle_masks {"cameras": {"<id>": {"vehicles": n, "with_outline": k}}, "probe_ms_per_s": x,
 "probe_max_ms": y, "errors": e, "graft": "match|stale|unknown"}`. `probe_*`는 `attach_vehicle_masks` 전체와 윤곽 계산 시간을 `time.perf_counter`로 합친
-값이다. seg를 끄면 이 줄은 없다.
+값이다. seg를 끄면 이 줄은 없다. 2026-11-06부터 필드가 나뉘었다(§10-7: `probe_max_ms` → `attach_max_ms`, 시간·개수 분리,
+`state`·`trips` 추가).
 
 ### 4-10. engine 미리 빌드 (`tools/build_vehicle_seg_engine.py`, 새)
 
@@ -556,3 +557,59 @@ API는 2초 주기로 읽으므로 1–2초 간격의 윤곽 갱신은 점유 �
 2. 구현(0, A, C 경량화, E, 표시 설정). B는 G1 export 인자만 바꾸고 G3로 engine을 다시 만든다.
 3. backend 재빌드(`--build --no-deps backend`)는 seg와 무관하게 먼저 해도 된다.
 4. 같은 시간대 seg 끔 10분 → seg 켬 10분(운영 문서 G6), 판정은 §5와 위 기준. 미달이면 즉시 되돌린다.
+
+### 10-7. 구현 (2026-11-06, 사용자 조정안: 0 → C → A+E, B는 계측 뒤 결정)
+
+모두 `vehicle_detection.OutlineRuntime` 하나에 모았다. det sink(`due_cameras`/`mark_pending`), seg src(`attach`),
+tracker src(`track_outline`), 5초 보고(`snapshot`) 네 스레드가 부르며 카운터와 보호 상태는 lock 하나, track 캐시는
+tracker 스레드만 만진다.
+
+- **0. 계측**: `vehicle_masks`에 `state`·`interval_s`·`trips`, 시간 `scan`/`mask_read`/`mask_write`(seg src)·
+  `outline`/`reattach`(tracker)별 `*_ms_per_s`, 합계 `probe_ms_per_s`, `attach_max_ms`, 개수 `seg_frames`·`seg_objects`·
+  `seg_mask_floats`·`paired`·`attached`·`reattached`·`cache_tracks`·`errors`. 이전 `probe_max_ms`는 `attach_max_ms`(seg src
+  batch당 최대)로 바뀌었다.
+- **A. seg 주기 제한**: det sink에서 det ROI(class 0)는 그대로 매 프레임, seg ROI(class `SEG_ROI_CLASS`=1)는
+  `VEHICLE_SEG_INTERVAL`(기본 2초, 0.2–60)이 지난 카메라 중 가장 오래된 **한 대에만, batch당 하나** 붙인다(seg 작업을
+  여러 batch에 나눠 batch 하나가 길게 멈추지 않게). seg config는 `operate-on-class-ids=1`, det는 0 그대로다. ROI를 붙인
+  프레임 번호를 카메라별로 기억해 seg src probe는 그 프레임만 본다.
+- **track별 재사용**: tracker src에서 seg 프레임의 차량(mask 있음)은 테두리 mask와 박스 기준(0–1) 윤곽을
+  `(카메라, track id)`로 캐시한다. 그 사이 프레임은 캐시를 현재 박스에 다시 붙이고(`alloc_mask_array` + 복사) 윤곽을
+  현재 박스로 옮긴다. 캐시는 `3 × 간격`이 지나면 버린다. tracker 미할당 id는 캐시하지 않는다. 윤곽 좌표 계산을
+  `outline_shape()`(0–1) + `place_outline()`으로 나눠 seg 프레임과 재사용 프레임이 같은 함수로 좌표를 만든다.
+- **E. 자동 보호**: seg src·tracker의 seg 관련 시간을 5초 창으로 합쳐 3창 연속 200 ms/s를 넘으면(15초) seg ROI를 더 넣지
+  않고(대기 중 프레임 기록도 지움) 캐시를 비운다. 즉 seg 추론·mask 처리·재부착이 모두 멈추고 차량은 3 px 박스로 돌아간다.
+  로그 `vehicle_segmentation_suspended {"ms_per_s","windows","trips","retry_after_s"}`(diagnostics와 무관하게 항상).
+  **다시 켜는 조건: 자동 재시도.** 600초 뒤 `vehicle_segmentation_resumed`와 함께 재개하고, 다시 걸릴 때마다 대기를 두 배로
+  늘려 최대 3600초(재시작하면 처음부터). 재시작 전까지 끄는 방식 대신 이것을 고른 이유: OTA engine 빌드나 학습처럼 잠깐의
+  부하로도 걸릴 수 있어서 영구히 끄면 윤곽이 하루 종일 사라질 수 있고, 재시도 한 번의 대가는 최대 15초 저하다(1시간
+  간격이면 시간의 0.4%). 정확히 200 ms/s는 허용(초과만 셈), 기준 아래 창이 하나라도 있으면 연속 수를 0으로 되돌린다.
+- **C. 경량화(실제 반영분)**: seg ROI가 없는 프레임은 seg src probe가 객체를 순회하지 않는다. 윤곽은 seg 프레임에서만
+  행 스캔하고 나머지는 좌표만 옮긴다. det나 seg가 없는 프레임은 짝짓기를 만들지 않는다. seg mask를 표본 칸만 비교하도록
+  바꾸는 안은 CPU에서 빨라지지 않아(300×200 박스 84 → 93 µs) 넣지 않았다.
+- 표시: `VEHICLE_OUTLINE_RING_CELLS`(기본 2, 1–4, 4-이웃 침식 k번), `VEHICLE_OUTLINE_BOX_WIDTH` 기본 0(범위 밖도 0), 윤곽
+  없는 차량 3 px 유지. 시작 로그 `vehicle_segmentation interval_s=... ring_cells=... box_width=... guard_ms_per_s=200 guard_windows=3`.
+- CPU 비용(호스트 Python 3.11, fake mask라 pyds 제외): 재부착 차량당 약 44 µs, ring 2칸 130–370 µs(박스 120×90–600×400,
+  seg 프레임에서만). 낮 기준 주차장 차량-프레임이 초당 약 600이면 재부착은 약 26 ms/s다. seg 프레임 비용을 사고 때 값(차량당
+  2.7 ms)으로 잡으면 5대 × 2초 간격 × 약 10대 = 약 68 ms/s다. 합계는 보호 기준(200) 아래지만 §5 probe 목표(50)는 넘을 수
+  있다. 판정은 fps 기준으로 하고 0번 계측으로 확인한다(pyds 비용은 GPU에서만 잴 수 있음).
+
+파서가 내보내는 mask 크기(숫자):
+
+- export(`utils/export_yolo11_seg.py`)는 객체마다 박스 영역을 proto 전체 해상도로 RoiAlign한다. 640 입력이면 proto 160×160,
+  출력은 객체당 6 + 160 × 160 = 25606 float32, ROI당 `--max-detections` 100개(conf ≥ 0.1, 80클래스 공용) → ROI당 10.2 MB.
+- 파서(`nvdsparseseg_Yolo.cpp` `addSegProposal`)는 pre-cluster 임계값을 넘은 객체마다 `new float[25600]` + memcpy(102,400 B)로
+  mask를 만들고 `mask_width`/`mask_height` = 160/160으로 둔다. nvinfer `attach_metadata_detector()`가 붙일 객체마다
+  한 번 더 `g_malloc` 복사한다(§2-1). Python은 짝지은 seg마다 25600 float를 읽어 비교한다(`seg_mask_floats`로 보임).
+- 실제 정보량은 박스가 덮는 proto 칸뿐이다. 1920×1080 프레임이 640×360(+패딩)으로 줄므로 300×200 px 차량은 네트워크에서
+  100×67 px, proto에서 25×17칸(425 float)이다. 160×160은 그 칸을 보간해 늘린 값이다.
+- **C++ 파서 patch 후보(계측 뒤 결정)**: 파서가 박스의 proto 해상도 `ceil(w_net/4) × ceil(h_net/4)`로 줄여(160×160에서
+  최근접/평균) 내보내고 `mask_width/height`를 그 크기로 둔다. 위 예에서 객체당 mask가 약 60배 작아지고 두 번의 복사와 Python
+  읽기가 함께 준다. Python `resample_mask()`는 mask의 width/height를 그대로 쓰므로 수정이 필요 없다. 위험: 객체마다 다른
+  mask 크기를 nvinfer·nvdsosd가 그대로 받는지 Not verified, 경계 해상도가 proto 수준으로 낮아짐(정보량은 같음). 판단
+  기준: G6-2에서 `mask_read_ms_per_s`가 seg 관련 시간의 큰 몫이면 우선한다.
+- **B(export topk)**: `seg_objects`/`seg_frames`(seg 프레임당 seg 객체 수)를 보고 정한다. 관측 차량 최대 14대.
+
+backend(2026-11-06 확인): 실행 중인 backend의 OpenAPI에 126bf4d의 `AutolabelCreate.image_ids`가 있고 차량 `outline`이
+없다. image에 들어가는 파일(`backend/app`, `backend/requirements.txt`, `camera_config.py`, `backend/Dockerfile`) 중
+126bf4d 뒤 변경은 08ae789의 `backend/app/schemas.py`(`VehicleIn.outline`, 형식 오류는 그 차량만 null) 하나다. 빠진 영향은
+API 차량 객체의 `outline` 필드뿐이고 DB·다른 API는 같다. 재빌드 시점은 사용자가 정한다.
