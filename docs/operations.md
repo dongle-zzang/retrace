@@ -275,7 +275,7 @@ G6. 확인: 주차장 카메라 JPEG에 윤곽선과 얇은 박스(GPU 모드 `d
 sudo docker compose logs -t --since=30m retrace | grep -E ' fps=|stage=vehicle(-seg)?-batch|^.*vehicle_masks '
 sudo docker compose exec -T retrace python3 tools/measure_preview.py --seconds 600 --report .cache/measure/seg-off.json
 timeout 600 nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader -l 1   # 호스트
-top -b -d 5 -n 120 -p "$(pgrep -f 'preview.py --cameras' | tail -1)"            # 호스트
+top -b -w 512 -d 5 -n 120 -p "$(pgrep -f 'preview.py --cameras' | tail -1)"     # 호스트, -w 없으면 %CPU 열이 잘림
 ```
 
 되돌리기: `.env`의 `VEHICLE_SEG_INFER_CONFIG`를 비우고 `sudo docker compose up -d --force-recreate retrace`.
