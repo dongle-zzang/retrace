@@ -4,6 +4,8 @@
 오래됨 경고(§4-8), 윤곽 차량 박스 두께 설정(§4-5), 행 스캔이 조각 사이를 잇는 한계를 API 계약에 명시(§4-7).
 구현 계획은 [plans/2026-11-05-vehicle-outline-segmentation.md](../plans/2026-11-05-vehicle-outline-segmentation.md).
 구현됨(2026-11-05): CPU 테스트 통과, GPU 검증(§7-2)과 운영 적용은 대기. 운영 절차는 `docs/operations.md` "차량 윤곽선(seg, 선택)".
+**운영 적용 실패(2026-11-06)**: seg를 켜자 Python probe가 GIL을 포화시켜 전 카메라가 약 2.3 fps로 떨어져 되돌렸다. 원인
+분해와 수정안(승인 대기)은 §10. 지금 구현으로 seg를 다시 켜지 않는다.
 
 구현 메모(설계와 다른 점):
 
@@ -354,7 +356,9 @@ pipeline은 건드리지 않는다. 이 단계가 config 해석, 파서 `.so`와
 
 ## 5. 성능: 측정 방법과 허용 기준
 
-seg 끔(기준선)과 seg 켬을 비슷한 시간대에 각각 30분 잰다. 같은 카메라가 online이어야 한다.
+seg 끔(기준선)과 seg 켬을 **같은 시간대에 연달아** 각각 10분(`--seconds 600`) 잰다. 같은 카메라가 online이어야 한다.
+카메라가 밤에 프레임을 줄여 FPS 합계가 낮/밤 334.2 / 192.2로 달랐으므로(2026-11-05·06, seg 끔) 다른 시간대의
+기준선과는 비교하지 않고, 일출·일몰 전후는 피한다(2026-11-06 결정).
 
 | 항목 | 방법 | 허용 기준 |
 | --- | --- | --- |
@@ -427,7 +431,8 @@ seg 끔(기준선)과 seg 켬을 비슷한 시간대에 각각 30분 잰다. 같
 1차는 seg 없이 재시작해 카메라 복구 감시(f6db046)만 적용하고 G4를 잰다. 하루 동안 `camera_status` 252줄이 유지되면
 2차로 G1 → G2 → G3 → G5 → G6을 한다. G3과 `retrace-training-worker` 재시작은 학습 job이 없을 때 한다.
 
-- G4(1차) seg 끔 상태로 §5 기준선 30분.
+- G4(1차) seg 끔 상태 측정. 2026-11-06부터는 참고값이고, 판정용 기준선은 G6 직전 같은 시간대에 다시 잰다(§5).
+- backend 재빌드 `sudo docker compose up -d --build --no-deps backend`(API `outline`, seg와 무관하게 먼저 해도 됨, §10-3).
 - G5 `.env`에 `VEHICLE_SEG_INFER_CONFIG=models/yolo11m-seg/vehicle_seg_infer.txt`를 넣고
   `sudo docker compose up -d --force-recreate retrace`(env_file은 재생성해야 반영). 로그에서 seg engine을 다시 빌드하지 않고
   deserialize했는지 확인.
@@ -456,3 +461,98 @@ seg 끔(기준선)과 seg 켬을 비슷한 시간대에 각각 30분 잰다. 같
 4. `preview.py`: seg element·probe 이동·`display-mask`·박스 두께·윤곽 게시·진단.
 5. `tools/build_vehicle_seg_engine.py`, `training/graft_seg.py`, patch 파일, `.gitignore`.
 6. 전체 CPU 테스트, 문서 갱신, `.ai/WORK.md`에 GPU 검증 대기 항목 기록 → 커밋.
+
+## 10. 운영 적용 실패와 처리량 수정안 (2026-11-06, 수정안은 승인 대기, 구현 전)
+
+### 10-1. 무엇이 일어났나
+
+2026-11-06 00:48 UTC에 seg를 켜고(G5) 약 5분 뒤 되돌렸다. engine은 재빌드 없이 deserialize, `graft=match`, 영상에 윤곽선이
+그려졌다. 그러나 주차장 외 카메라를 포함한 **모든 카메라가 약 2.3 fps**로 떨어졌고, `/api/cameras/b1_parking_overview/vehicles`는
+차량 13대 중 윤곽 0이었다. 아래 수치는 그 실행의 `--diagnostics` 로그(00:48:46–00:52:40 UTC 정상 상태 45개 5초 창)에서 뽑았다.
+
+### 10-2. 원인 분해: (b) Python probe가 GIL을 포화시켰다
+
+| 관측 | 값 | 뜻 |
+| --- | --- | --- |
+| `stage=mux-batch` / `vehicle-batch` / `vehicle-seg-batch` | 셋 다 1.5–3.1 batch/s, 창마다 거의 같음(중앙값 약 2.3) | seg가 det보다 밀리지 않는다. batch 전체 속도가 묶였다 |
+| 카메라별 `fps=` | online 18대 모두 중앙값 2.28–2.36(합 41.2), 주차장 외 카메라도 같음 | 공유 batch가 한 줄로 막혀 전 카메라가 같은 속도 |
+| `stage=decoded` | 18대 모두 2.3 fps | 역압이 디코더까지 전해졌다(카메라 송출 문제가 아님) |
+| `vehicle_masks.probe_ms_per_s` | 1216–1490(중앙값 약 1380), `probe_max_ms` 531–1202, `errors` 0 | probe 시간이 벽시계 1초당 1초를 넘는다 |
+| 시작 직후 창(00:48:35) | batch 11.1/s일 때 이미 `probe_ms_per_s` 939 | 경합이 적을 때도 batch 11/s에서 한 코어가 찬다 |
+| 차량당 probe 시간 | 시작 직후 2.7 ms(939 ms/s × 5 s ÷ 1768대), 정상 상태 약 11 ms(≈1380 × 5 ÷ 약 600) | 포화 뒤에는 GIL 대기가 섞인다 |
+| `camera_status` 보고 간격 | 5.1–5.6초(정상 5.0초), 1분 252 → 231줄 | 제어 루프(Python)도 GIL을 못 받는다 |
+| numpy 부분만(호스트 CPU, 경합 없음) | 이식 0.18–0.27 ms + 윤곽 0.10–0.12 ms / 차량(박스 120×90–600×400) | 2.7 ms 중 약 0.3 ms. 나머지는 pyds 메타 접근·seg 객체 순회·GIL |
+| HTTP 503 | 140줄 | 결과(프레임이 오래돼 거절). 원인 아님 |
+
+판정:
+
+- **(b) Python probe가 병목이다.** seg src의 `attach_vehicle_masks`와 tracker src의 윤곽 계산은 서로 다른 streaming
+  thread에서 돌지만 같은 GIL을 쓴다. 두 시간의 합이 벽시계를 넘고(1.3–1.5초/초), 같은 프로세스의 제어 루프까지 늦어진다.
+  batch 하나의 probe가 끝나야 다음 batch가 지나가므로 공유 pipeline 전체가 probe 속도(약 2.3 batch/s)로 묶였다.
+- **(a) seg 추론·출력은 이번 실행에서 병목이 아니었다.** 추론 시간은 로그에 없어 직접 재지 못했다(Not verified). 그러나
+  GPU나 파서가 병목이었다면 Python probe는 놀고 제어 루프는 제때 돌았어야 한다. 관측은 그 반대다. 다만 (b)를 고치면
+  (a)가 다음 한계가 될 수 있다. 출력은 ROI당 100 × 25606 float32 = 10.2 MB, batch 5면 51 MB를 host로 복사하고, 파서가
+  객체마다 mask를 다룬다. 낮 batch 속도(약 25/s로 추정, Not verified)면 초당 약 1.3 GB다.
+- **(c) 그 밖의 원인 증거는 없다.** 503 응답과 `output_stalled`는 프레임이 늦어진 결과다.
+- 설계 추정이 틀린 곳: §4-6은 numpy 비용(차량당 170 + 100 µs)과 프레임당 평균 4대를 가정했다. 실제는 주차장 프레임당
+  약 10대(b1_parking_overview 13, 최대 14)이고, 차량당 시간은 pyds 접근을 포함해 약 10배였다. 2.7 ms의 세부(pyds
+  `get_mask_array`/`alloc_mask_array`, ROI당 최대 100개(conf ≥ 0.1)인 seg 객체 순회·삭제, IoU 짝짓기)는 Not verified다.
+
+### 10-3. API `outline`이 0인 원인: backend가 새 스키마로 다시 만들어지지 않았다
+
+- preview 쪽은 윤곽을 만들었다. `vehicle_masks`의 `with_outline`/`vehicles`가 창마다 99% 이상이었다(예: 1768 중 1765).
+- 지금 실행 중인 backend의 `/api/cameras/b1_parking_overview/vehicles` 차량 객체에는 `outline` 키 자체가 없다
+  (2026-11-06 확인, 키: bbox·class·class_id·confidence·track_id·tracker_confidence). 08ae789의 `VehicleIn`은 `outline`
+  기본값이 None이라 새 backend라면 seg를 꺼도 `"outline": null`이 나와야 한다. 옛 `VehicleIn`(pydantic 기본 extra 무시)이
+  필드를 버린 것이다.
+- backend 코드는 image에 들어간다(compose `build`). G5에 `sudo docker compose up -d --build --no-deps backend`가 빠져 있었다.
+  `outline`은 하위 호환(없으면 null)이라 backend는 seg와 무관하게 먼저 갱신해도 된다. 운영 문서 G5에 추가했다.
+
+### 10-4. 처리량 수정안 비교
+
+목표: seg가 공유 pipeline의 batch 속도를 묶지 않는다. 수용 기준은 **같은 시간대에 연달아 잰** seg 끔 대비 카메라별
+fps ≥ 90%, 합계 ≥ 95%(§5 갱신). 낮/밤 합계가 334.2 / 192.2로 달라 다른 시간대 기준선은 쓰지 않는다.
+
+| 안 | 내용 | 예상 효과 | 위험 |
+| --- | --- | --- | --- |
+| **0. 계측 먼저** | `vehicle_masks`를 `attach_ms_per_s`·`outline_ms_per_s`·`seg_objects`·`seg_frames`로 나눔 | 2.7 ms/차량의 세부를 안다. 아래 안의 효과를 수치로 확인 | 거의 없음(5초 보고 필드 추가) |
+| **A. seg 주기 제한 + track별 윤곽 재사용** | 주차장 카메라마다 `VEHICLE_SEG_INTERVAL`초(기본 1.0, 시간 기준) 지난 프레임에만 seg용 ROI(class 1)를 추가하고 seg config는 `operate-on-class-ids=1`. seg 프레임에서 만든 ring(float32)과 박스 기준 정규화 윤곽을 tracker src에서 `(카메라, track_id)`로 캐시. 그 사이 프레임은 캐시를 현재 박스에 다시 붙임(`alloc_mask_array` + 복사, 윤곽은 32점 좌표 변환) | seg 추론·host 복사·파서·짝짓기가 카메라 fps × 간격만큼 줄어든다(낮 10–28 fps면 1/10–1/28). 프레임마다 남는 일은 차량당 재부착 1회(비용 Not verified, 0단계로 잰다) | 움직이는 차량 윤곽이 최대 1초 늦음(현재 박스로 늘려 그려 위치는 따라감). 새 track은 다음 seg 프레임까지 윤곽 없음(박스 표시). track id 바뀜 시 짧게 이전 ring. 캐시는 track 소멸·3×간격 경과로 정리 |
+| **B. export topk 축소** | 재export `--max-detections 30`(관측 최대 14대, 80클래스 공용 슬롯이라 여유). 필요하면 `--conf-threshold` 0.25 | 출력 10.2 → 3.1 MB/ROI(−70%), host 복사·파서·seg 객체 순회가 비례해 준다 | 붐비는 프레임에서 31번째 이후 잘림. 임계값을 올리면 det가 찾은 차량을 seg가 놓칠 수 있음(커버리지로 확인). G1 export·G3 engine 재빌드 필요 |
+| C. mask 처리 경량화 / streaming thread 밖 | 경량화: seg 객체를 class로 먼저 거르고, 윤곽을 tracker src에서 mask를 다시 읽지 않고 seg 프레임에서 한 번만 계산(A와 함께). thread 이동: 계산을 작업 스레드로 | 경량화는 A의 seg 프레임 비용을 줄인다. thread 이동은 효과가 거의 없다 | thread 이동은 같은 GIL을 쓰고, mask는 batch가 지나가면 사라져 어차피 probe 안에서 복사해야 한다. OSD는 그 프레임의 mask가 필요해 비동기로 그릴 수 없다 → **thread 이동은 하지 않는다** |
+| D. seg를 별도 branch로 분리 | 주차장 카메라만 낮은 속도로 별도 seg 경로(tee/두 번째 mux)에서 추론하고 결과를 track에 비동기로 맞춤 | 주 경로와 완전 분리 | tee 두 branch가 같은 `NvDsBatchMeta`를 공유(경쟁)해 복사나 두 번째 mux가 필요, GPU 메모리 증가, source 복구(재설정·재생성)와 얽힘, 비동기 짝짓기. **보류**(A+B+E가 기준에 못 미칠 때만) |
+| **E. 자동 보호** | seg 관련 Python 시간이 3창(15초) 연속 200 ms/s를 넘으면 seg ROI 추가를 멈추고(seg 추론 0, 윤곽 없음, 박스 복귀) `vehicle_segmentation_suspended`를 남김. 재개는 재시작 | 오늘 같은 경우 전 카메라 저하가 15초로 끝난다 | 일시적 부하로 윤곽이 꺼질 수 있음(로그로 보임). 임계값은 0단계 수치로 다시 정함 |
+
+권고: **0 → A(+C 경량화) → B → E**를 한 번에 구현하고, 처음 적용은 `VEHICLE_SEG_INTERVAL=2`로 시작해 기준을 넘으면
+1.0으로 줄인다. 근거: 차량당 2.7 ms를 그대로 두더라도 seg 프레임이 주차장 5대 × 초당 1회면 seg 프레임 비용은 약
+135 ms/s, 2초 간격이면 약 70 ms/s다. 여기에 B와 C 경량화로 seg 객체 순회를 줄인다. 프레임마다 남는 재부착 비용이
+기준(§5 probe ≤ 50 ms/s)을 넘으면 그때 간격·재부착 방식을 다시 정한다. D는 마지막 수단이다.
+
+API는 2초 주기로 읽으므로 1–2초 간격의 윤곽 갱신은 점유 판정·API에 영향이 없다.
+
+### 10-5. 표시: 더 진하고 두꺼운 윤곽, 윤곽 차량의 박스 숨김
+
+- ring 두께 설정 `VEHICLE_OUTLINE_RING_CELLS`(정수 1–4, 기본 2). ring = grid에서 4-이웃 침식을 k번 한 내부를 뺀 칸.
+  1칸 = 4 mux px ≈ JPEG(1280×720) 2.7 px이므로 기본 2칸 ≈ 5.3 px. A를 하면 seg 프레임에서만 계산해 비용은 무시할 만하다.
+  범위 밖은 2를 쓰고 한 줄 남긴다. 바깥 윤곽(API)은 두께와 무관하다.
+- 연하게 보이는 원인(가설, Not verified):
+  1. 선이 가늘다. 1칸 ring은 JPEG에서 2.7 px다.
+  2. JPEG 색 해상도. MJPEG 경로는 I420(4:2:0)으로 바꿔 `nvjpegenc`(quality 80)로 인코딩한다. 색 성분은 가로·세로 절반
+     해상도라 3 px 이하의 주황 선은 주변 색과 섞여 채도가 빠진다. 두께 2칸 이상이면 색 성분 2칸 이상을 덮어 크게 준다.
+  3. `nvll_osd_draw_segment_masks`(closed source)의 색과 투명도. DS 7.0은 mask 객체의 `border_color`를 무작위 색으로
+     바꾸지만 우리는 tracker src에서 주황(1.0, 0.65, 0, 1.0)으로 다시 쓴다. mask가 이 색을 쓰는지, alpha를 섞는지는 모른다.
+  확인 방법: 다음 seg 켬 창에서 JPEG 한 장을 저장해 ring 픽셀 RGB를 (255, 166, 0)과 비교한다. 색상은 맞고 밝기만 연하면
+  1·2(두께로 해결), 색상이 다르면 3이다. 3이고 OSD로 조절할 수 없으면 §4-5 대비책(display meta 선, 두께·색 지정 가능)으로
+  가되, 프레임당 Python 비용을 A와 같은 캐시 방식으로 다시 잰다.
+- 윤곽이 붙은 차량의 박스: `VEHICLE_OUTLINE_BOX_WIDTH` 기본값을 1 → 0으로 바꾼다(글자 `Vehicle`은 남음). 두께 0이 정말
+  안 그려지는지는 G6에서 본다.
+- 윤곽이 없는 차량의 박스는 **지금처럼 3 px로 유지**를 권한다. 그 차량도 점유 판정에 쓰이는 검출이므로 화면에서 사라지면
+  안 되고(글자만으로는 위치·크기가 안 보임), 굵은 박스 = 윤곽 없음이 커버리지 문제를 눈으로 보여 준다. A를 하면 윤곽 없는
+  차량은 새 track(≤ 간격)과 mask 실패 차량만 남아 박스가 많지 않다.
+
+### 10-6. 승인 뒤 구현·검증 순서(제안)
+
+1. CPU 테스트 먼저: seg ROI 간격(시간 기준, 카메라별), track 캐시 수명·정리, 재부착, ring 두께 k, 박스 기본값 0, 보호 장치
+   전이, 진단 필드 분리.
+2. 구현(0, A, C 경량화, E, 표시 설정). B는 G1 export 인자만 바꾸고 G3로 engine을 다시 만든다.
+3. backend 재빌드(`--build --no-deps backend`)는 seg와 무관하게 먼저 해도 된다.
+4. 같은 시간대 seg 끔 10분 → seg 켬 10분(운영 문서 G6), 판정은 §5와 위 기준. 미달이면 즉시 되돌린다.

@@ -178,6 +178,10 @@ seg 준비가 실패하면 `Vehicle segmentation unavailable; details hidden; ou
 `models/yolo11m-seg/`(gitignore)에 둡니다: DeepStream-Yolo-Seg clone(commit `a8ec7ec`, MIT, 저장소 patch 적용),
 `graft.pt`·`manifest.json`(이식), `graft.onnx`·`labels.txt`(export), `vehicle_seg_infer.txt`.
 
+**주의(2026-11-06)**: 지금 구현으로 seg를 켜면 Python probe가 공유 pipeline을 묶어 **모든 카메라가 약 2 fps로
+떨어집니다**(2026-11-06 00:48 UTC 적용 후 되돌림). 처리량 수정([설계 문서](superpowers/specs/2026-11-05-vehicle-outline-segmentation-design.md) §10)이
+구현되기 전에는 G5를 하지 않습니다.
+
 배포는 두 번에 나눕니다(2026-11-05 결정). 카메라 복구 감시(f6db046)와 seg를 한 번에 켜면 문제가 생겼을 때 원인을
 나눌 수 없고, 복구 감시만 적용된 상태가 seg 측정의 기준선이 되어야 하기 때문입니다.
 
@@ -188,13 +192,15 @@ seg 준비가 실패하면 `Vehicle segmentation unavailable; details hidden; ou
 2. `sudo docker compose up -d --force-recreate retrace`. 시작 로그에 `vehicle_segmentation` 줄이 없어야 합니다(seg 끔).
 3. 몇 분 뒤 `sudo docker compose logs -t --since=1m retrace | grep -c camera_status`가 252 전후인지 봅니다
    (아래 "복구 감시" 일일 확인과 같음).
-4. G4. 이 상태로 30분 기준선을 잽니다(아래 측정, 보고 파일 `seg-off.json`). 결과는 `.ai/WORK.md`의 측정 기록 자리에
-   적습니다.
+4. G4. 이 상태로 10분 측정합니다(아래 측정, 보고 파일 `seg-off.json`). 결과는 `.ai/WORK.md`의 측정 기록 자리에
+   적습니다. 카메라가 밤에 프레임을 줄여(seg 끔 FPS 합계 낮 334.2, 밤 192.2) **G4는 참고값**이고, 수용 판정용
+   기준선은 G6에서 seg를 켜기 직전 같은 시간대에 다시 잽니다(2026-11-06 결정).
 
 **2차: seg 켜기(1차 뒤 하루 관찰)**
 
 진행 조건: 1차 재시작 뒤 하루 동안 위 `camera_status` 수가 252 전후로 유지됩니다. 0이 나온 적이 있으면 2차를 미루고
-복구 감시 문제를 먼저 봅니다. 순서는 G1 → G2 → G3 → G5 → G6입니다(G4는 1차에서 끝남).
+복구 감시 문제를 먼저 봅니다. 순서는 G1 → G2 → G3 → G6-1(seg 끔 기준선) → G5 → G6-2(seg 켬 측정·확인)입니다.
+G6-1과 G6-2는 같은 시간대에 연달아 하고, 일출·일몰 전후는 피합니다.
 
 주의: G3과 `retrace-training-worker` 재시작은 학습·자동 라벨링 job이 없을 때 합니다. G3 engine 빌드는 학습과 같은
 GPU를 쓰고, worker 재시작은 진행 중인 job을 끊을 수 있습니다. 시작 전에 아래가 `None`인지 확인합니다.
@@ -258,22 +264,30 @@ sudo docker compose exec -T -e VEHICLE_SEG_INFER_CONFIG=models/yolo11m-seg/vehic
 
 `vehicle_segmentation graft=...`와 `Engine ready: .cache/vehicle-seg/pgie/...`가 나와야 합니다.
 
-G5. `.env`에 `VEHICLE_SEG_INFER_CONFIG=models/yolo11m-seg/vehicle_seg_infer.txt`를
+G6-1. seg를 켜기 직전, seg 끔 상태로 10분 기준선을 잽니다(아래 측정, 보고 파일 `seg-off-<날짜>.json`).
+
+G5. backend가 `outline` 필드를 아는 image인지 먼저 확인합니다. backend 코드는 image에 들어가므로 08ae789 이후 한 번은
+`sudo docker compose up -d --build --no-deps backend`가 필요합니다(`outline`은 하위 호환이라 seg와 무관하게 먼저 해도
+됨). 확인: `curl -s http://127.0.0.1:8000/api/cameras/b1_parking_overview/vehicles`의 차량 객체에 `outline` 키가 있어야
+합니다(seg 끔이면 null). 키가 없으면 옛 image입니다(2026-11-06 실제로 빠져 API 윤곽이 0이었음).
+그다음 `.env`에 `VEHICLE_SEG_INFER_CONFIG=models/yolo11m-seg/vehicle_seg_infer.txt`를
 넣고 `sudo docker compose up -d --force-recreate retrace`(env_file 변경은 재생성해야 반영). 로그에 seg engine
 build 없이 deserialize가 나오고 `vehicle_segmentation graft=match`인지 봅니다.
 OTA 상태 API에 `segmentation_graft`를 보이려면 `systemctl --user restart retrace-training-worker`가 필요합니다
 (학습 job이 없을 때, 위 주의).
 
-G6. 확인: 주차장 카메라 JPEG에 윤곽선과 얇은 박스(GPU 모드 `display-mask`와 색), 화면 가장자리 차량의 윤곽 위치,
+G6-2. seg를 켠 뒤 카메라가 다시 online이 되면 곧바로 G6-1과 같은 10분 측정을 합니다(보고 파일 `seg-on-<날짜>.json`).
+판정은 G6-1과 비교해 카메라별 fps ≥ 90%, 합계 ≥ 95%(설계 §5)입니다. 첫 5초 창부터 `vehicle_masks`의
+`probe_ms_per_s`가 수백 이상이거나 `fps=`가 전 카메라에서 함께 떨어지면 측정을 기다리지 말고 바로 되돌립니다.
+확인: 주차장 카메라 JPEG에 윤곽선과 얇은 박스(GPU 모드 `display-mask`와 색), 화면 가장자리 차량의 윤곽 위치,
 `curl -s http://127.0.0.1:8000/api/cameras/b1_parking_overview/vehicles`의 `outline`, `VEHICLE_OUTLINE_BOX_WIDTH=0`으로
 재생성했을 때 박스가 사라지고 글자가 같은 자리에 남는지, 24시간 RSS·VRAM 추이.
 
-측정(seg 끔은 1차 G4, 켬은 2차 G6, 각 30분, 허용 기준은 설계 §5). 보고 파일은 G4에서 `seg-off.json`, G6에서
-`seg-on.json`입니다:
+측정(G4·G6-1·G6-2 공통, 각 10분, 허용 기준은 설계 §5). 보고 파일 이름만 바꿉니다:
 
 ```bash
-sudo docker compose logs -t --since=30m retrace | grep -E ' fps=|stage=vehicle(-seg)?-batch|^.*vehicle_masks '
-sudo docker compose exec -T retrace python3 tools/measure_preview.py --seconds 600 --report .cache/measure/seg-off.json
+sudo docker compose logs -t --since=10m retrace | grep -E ' fps=|stage=vehicle(-seg)?-batch|^.*vehicle_masks '
+sudo docker compose exec -T retrace python3 tools/measure_preview.py --seconds 600 --report .cache/measure/seg-off-<날짜>.json
 timeout 600 nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader -l 1   # 호스트
 top -b -w 512 -d 5 -n 120 -p "$(pgrep -f 'preview.py --cameras' | tail -1)"     # 호스트, -w 없으면 %CPU 열이 잘림
 ```
