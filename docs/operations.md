@@ -192,7 +192,8 @@ batch당 최대 `attach_max_ms`이고, 개수 필드는 `seg_frames`·`seg_objec
 
 **주의(2026-11-06)**: 처음 구현(매 프레임 seg)으로 seg를 켜자 Python probe가 공유 pipeline을 묶어 **모든 카메라가 약
 2 fps로 떨어졌습니다**(2026-11-06 00:48 UTC 적용 후 되돌림). seg 간격 제한·윤곽 재사용·자동 보호([설계 문서](superpowers/specs/2026-11-05-vehicle-outline-segmentation-design.md)
-§10-7)는 구현됐지만 GPU에서 아직 검증하지 않았습니다. 사용자가 시점을 정해 G6-1 → G5 → G6-2로 확인합니다.
+§10-7)를 0b247cc로 시험했지만(2026-11-06 02:14 UTC) 자동 보호가 2회 걸려 seg가 58초만 돌았습니다. 재부착 비용이
+가장 커서 그대로는 쓸 수 없습니다(설계 §10-8, 수정안 승인 대기). 수정 전에는 seg를 켜지 않습니다.
 
 배포는 두 번에 나눕니다(2026-11-05 결정). 카메라 복구 감시(f6db046)와 seg를 한 번에 켜면 문제가 생겼을 때 원인을
 나눌 수 없고, 복구 감시만 적용된 상태가 seg 측정의 기준선이 되어야 하기 때문입니다.
@@ -288,10 +289,15 @@ build 없이 deserialize가 나오고 `vehicle_segmentation graft=match`인지 �
 OTA 상태 API에 `segmentation_graft`를 보이려면 `systemctl --user restart retrace-training-worker`가 필요합니다
 (학습 job이 없을 때, 위 주의).
 
-G6-2. seg를 켠 뒤 카메라가 다시 online이 되면 곧바로 G6-1과 같은 10분 측정을 합니다(보고 파일 `seg-on-<날짜>.json`).
+G6-2. seg를 켠 뒤 **모든 카메라가 online이 된 것을 확인하고**(`camera_status`의 `"state":"online"` 수가 G6-1과 같음;
+2026-11-06에는 4f_lobby가 연결 중일 때 시작해 그 카메라만 0으로 잡힘) G6-1과 같은 10분 측정을 합니다(보고 파일 `seg-on-<날짜>.json`).
 판정은 G6-1과 비교해 카메라별 fps ≥ 90%, 합계 ≥ 95%(설계 §5)입니다. 첫 5초 창부터 `vehicle_masks`의
 `probe_ms_per_s`가 수백 이상이거나 `fps=`가 전 카메라에서 함께 떨어지면 측정을 기다리지 말고 바로 되돌립니다.
 `vehicle_segmentation_suspended`가 찍혔으면 보호가 작동한 것이므로 그 줄과 직전 `vehicle_masks` 몇 줄을 기록하고 되돌립니다.
+중단된 뒤의 10분 측정은 seg 처리량이 아니라 중단 상태를 잰 값이므로 판정에 쓰지 않습니다.
+되돌리기 전에 로그를 파일로 저장합니다(`sudo docker compose logs -t --since <켠 시각> retrace > <파일>`). 컨테이너를 다시
+만들면 이전 로그는 `docker compose logs`에 남지 않습니다. 되돌린 뒤 `.env`에 `VEHICLE_SEG_INFER_CONFIG=` 값이 비었는지
+(`grep -c '^VEHICLE_SEG_INFER_CONFIG=.' .env`가 0) 다시 확인합니다.
 이 측정의 `vehicle_masks` 시간 필드(특히 `mask_read_ms_per_s`와 `seg_mask_floats`)로 C++ 파서 mask 축소와 export topk
 축소(설계 §10-7)를 할지 정합니다.
 확인: 주차장 카메라 JPEG에 윤곽선과 얇은 박스(GPU 모드 `display-mask`와 색), 화면 가장자리 차량의 윤곽 위치,
@@ -306,6 +312,24 @@ sudo docker compose exec -T retrace python3 tools/measure_preview.py --seconds 6
 timeout 600 nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader -l 1   # 호스트
 top -b -w 512 -d 5 -n 120 -p "$(pgrep -f 'preview.py --cameras' | tail -1)"     # 호스트, -w 없으면 %CPU 열이 잘림
 ```
+
+RSS 기록(G6-1·G6-2 공통, 2026-11-06 추가). 재시작 직후 RSS가 오르는 것이 기동 후 증가인지 누수인지 나누려면
+seg 끔과 seg 켬 모두 **재시작 직후부터** 같은 방식으로 1분마다 기록합니다(seg 끔의 기동 곡선이 비교 기준).
+재생성 명령 직후 호스트에서 시작하고, 최소 30분, 가능하면 seg 켬은 그대로 두어 24시간 기록합니다:
+
+```bash
+PID=$(pgrep -f 'python3 -u .*preview.py --cameras')
+while kill -0 "$PID" 2>/dev/null; do
+  printf '%s %s\n' "$(date -u +%FT%TZ)" "$(grep -E '^(VmRSS|RssAnon|RssFile|RssShmem):' /proc/$PID/status | awk '{printf "%s=%s ", $1, $2}')"
+  sleep 60
+done >> .cache/measure/rss-<seg-off|seg-on>-<날짜>.txt
+```
+
+같은 시간의 `vehicle_segmentation_suspended`·`resumed` 줄도 남깁니다(`sudo docker compose logs -t retrace | grep -E
+'vehicle_segmentation_(suspended|resumed)'`). 판정: seg 끔 곡선과 30분 시점 값을 비교하고, 30분 뒤에도 seg 켬
+`RssAnon`이 보호 `active` 구간에서만 계속 오르고 `suspended` 구간에서 멈추면 윤곽 경로(재부착 mask 할당) 쪽, 두 상태
+모두 오르면 seg와 무관한 원인으로 봅니다. 30분 뒤 seg 켬이 seg 끔보다 일정한 차이로 평평하면 누수가 아니라 seg의
+고정 사용량입니다. 설계 §10-8.
 
 되돌리기: `.env`의 `VEHICLE_SEG_INFER_CONFIG`를 비우고 `sudo docker compose up -d --force-recreate retrace`.
 
